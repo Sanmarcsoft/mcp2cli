@@ -45,6 +45,40 @@ BAKED_FILE = CONFIG_DIR / "baked.json"
 ARGPARSE_HELP_PERCENT_RE = re.compile(r"(?<!%)%(?![%\(])")
 
 
+def _mkdir_private(path: Path) -> None:
+    """Create *path* (and any parents) and lock it to owner-only ``0o700``.
+
+    ``Path.mkdir(mode=...)`` is masked by the process umask (the mode is
+    ANDed with ``~umask``), so under a typical ``022`` umask a directory
+    would land at ``0o755`` -- world-traversable. We therefore ``chmod``
+    explicitly afterwards to guarantee ``0o700`` regardless of the ambient
+    umask. Used for every directory that may hold credential material:
+    the token cache, baked auth configs, and session state.
+    """
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # mkdir's mode= is itself masked by umask, so a permissive umask would
+    # still leave the directory wider than 0o700 without this belt-and-braces
+    # chmod -- it's what actually guarantees the mode regardless of umask.
+    path.chmod(0o700)
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write *text* to *path* as an owner-only ``0o600`` file.
+
+    The file is created with ``0o600`` from the outset via ``os.open`` so the
+    contents are never briefly group/world-readable in the window between the
+    write and a follow-up ``chmod``. An explicit ``chmod`` still runs
+    afterwards so that a pre-existing file left world-readable by an older
+    (insecure) release is tightened on the next write.
+    """
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+    os.chmod(str(path), 0o600)
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -113,6 +147,14 @@ def resolve_secret(value: str) -> str:
             print(f"Error: secret file not found: {path}", file=sys.stderr)
             sys.exit(1)
         return path.read_text().rstrip("\n")
+    # Literal value (no env:/file: reference). It is visible to any local
+    # user via `ps auxww` / /proc/<pid>/cmdline. Warn but do not change
+    # behaviour or exit code -- the caller still gets the literal back.
+    print(
+        "Warning: secret passed as a literal CLI value is visible in process "
+        "listings; prefer env:VAR or file:/path",
+        file=sys.stderr,
+    )
     return value
 
 
@@ -435,7 +477,7 @@ def load_cached(key: str, ttl: int) -> dict | None:
 
 
 def save_cache(key: str, data: dict):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _mkdir_private(CACHE_DIR)
     (CACHE_DIR / f"{key}.json").write_text(json.dumps(data))
 
 
@@ -456,7 +498,7 @@ def _load_usage() -> dict:
 
 def _save_usage(data: dict) -> None:
     """Write usage data. Last-write-wins -- no file locking."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _mkdir_private(CACHE_DIR)
     USAGE_FILE.write_text(json.dumps(data, indent=2))
 
 
@@ -547,7 +589,10 @@ class FileTokenStorage:
     def __init__(self, server_url: str):
         key = hashlib.sha256(server_url.encode()).hexdigest()[:16]
         self._dir = OAUTH_DIR / key
-        self._dir.mkdir(parents=True, exist_ok=True)
+        # Both the shared oauth/ root and this per-server subdir hold OAuth
+        # tokens and DCR client secrets, so lock both to owner-only (0o700).
+        _mkdir_private(OAUTH_DIR)
+        _mkdir_private(self._dir)
         self._tokens_path = self._dir / "tokens.json"
         self._tokens_meta_path = self._dir / "tokens_meta.json"
         self._client_path = self._dir / "client.json"
@@ -564,13 +609,13 @@ class FileTokenStorage:
             return None
 
     async def set_tokens(self, tokens) -> None:
-        self._tokens_path.write_text(tokens.model_dump_json())
+        _write_private(self._tokens_path, tokens.model_dump_json())
         # Persist an absolute expiry timestamp so we can detect on a
         # later process start that the access token has expired.
         if tokens.expires_in is not None:
             try:
                 meta = {"expires_at": time.time() + float(tokens.expires_in)}
-                self._tokens_meta_path.write_text(json.dumps(meta))
+                _write_private(self._tokens_meta_path, json.dumps(meta))
             except Exception:
                 pass
         else:
@@ -622,7 +667,7 @@ class FileTokenStorage:
             return None
 
     async def set_client_info(self, client_info) -> None:
-        self._client_path.write_text(client_info.model_dump_json())
+        _write_private(self._client_path, client_info.model_dump_json())
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -1884,8 +1929,10 @@ def _load_baked(name: str) -> dict | None:
 
 def _save_baked_all(data: dict) -> None:
     """Save all baked configs to disk."""
-    BAKED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BAKED_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    # baked.json stores auth headers, API keys, and OAuth client secrets, so
+    # keep both the config dir (0o700) and the file (0o600) owner-only.
+    _mkdir_private(BAKED_FILE.parent)
+    _write_private(BAKED_FILE, json.dumps(data, indent=2) + "\n")
 
 
 def _baked_to_argv(config: dict) -> list[str]:
@@ -2957,7 +3004,7 @@ def session_start(
     transport: str = "auto",
 ):
     """Start a persistent session daemon."""
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _mkdir_private(SESSIONS_DIR)
 
     # Check if already running
     meta_path = _session_meta_path(name)
@@ -2976,30 +3023,47 @@ def session_start(
         meta_path.unlink(missing_ok=True)
         _session_sock_path(name).unlink(missing_ok=True)
 
-    # Spawn daemon
-    daemon_script = json.dumps(
-        {
-            "name": name,
-            "source": source,
-            "is_stdio": is_stdio,
-            "auth_headers": auth_headers,
-            "env_vars": env_vars,
-            "transport": transport,
-        }
+    # Spawn daemon.
+    #
+    # auth_headers/env_vars are credential material, so they must NOT be
+    # embedded in the child's argv (any local user can read that via
+    # `ps auxww` or /proc/<pid>/cmdline). Instead the config is written to a
+    # private 0o600 file and only its PATH is passed on the command line; the
+    # daemon reads the file and unlinks it immediately (see
+    # _run_session_daemon).
+    config_path = SESSIONS_DIR / f"{name}.config.json"
+    _write_private(
+        config_path,
+        json.dumps(
+            {
+                "name": name,
+                "source": source,
+                "is_stdio": is_stdio,
+                "auth_headers": auth_headers,
+                "env_vars": env_vars,
+                "transport": transport,
+            }
+        ),
     )
 
     log_path = _session_log_path(name)
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            f"import mcp2cli; mcp2cli._run_session_daemon({json.dumps(daemon_script)})",
-        ],
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=open(log_path, "a"),
-        stdin=subprocess.DEVNULL,
-    )
+    log_handle = open(log_path, "a")
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                f"import mcp2cli; mcp2cli._run_session_daemon({json.dumps(str(config_path))})",
+            ],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=log_handle,
+            stdin=subprocess.DEVNULL,
+        )
+    finally:
+        # The child inherits its own copy of the fd; the parent no longer
+        # needs the handle open regardless of whether Popen succeeded.
+        log_handle.close()
 
     # Wait for socket to appear
     sock_path = _session_sock_path(name)
@@ -3009,6 +3073,9 @@ def session_start(
             print(f"Session '{name}' started (PID {proc.pid})")
             return
         if proc.poll() is not None:
+            # Daemon died before reading its config; remove the secret file
+            # so it does not linger on disk.
+            config_path.unlink(missing_ok=True)
             print(
                 f"Error: session daemon exited with code {proc.returncode}",
                 file=sys.stderr,
@@ -3016,6 +3083,7 @@ def session_start(
             sys.exit(1)
         time.sleep(0.1)
 
+    config_path.unlink(missing_ok=True)
     print("Error: session daemon did not start in time", file=sys.stderr)
     proc.kill()
     sys.exit(1)
@@ -3106,8 +3174,21 @@ _SESSION_DISPATCH = {
 }
 
 
-def _run_session_daemon(config_json: str):
-    """Entry point for the session daemon process."""
+def _run_session_daemon(config_path: str):
+    """Entry point for the session daemon process.
+
+    *config_path* is the path to a private ``0o600`` JSON file written by
+    :func:`session_start`. The credential payload (auth headers, env vars) is
+    passed by path -- never inline in argv -- so it is not exposed via
+    ``ps``/``/proc/<pid>/cmdline``. The file is read and then unlinked
+    immediately so the secrets do not linger on disk.
+    """
+    _config_file = Path(config_path)
+    config_json = _config_file.read_text()
+    try:
+        _config_file.unlink()
+    except FileNotFoundError:
+        pass
     config = json.loads(config_json)
     name = config["name"]
     source = config["source"]
@@ -3141,12 +3222,17 @@ def _run_session_daemon(config_json: str):
                 "transport": "stdio" if is_stdio else "http",
                 "created_at": time.time(),
             }
-            meta_path.write_text(json.dumps(meta))
+            # meta stores the raw MCP source URL, which frequently carries
+            # credentials in the query string -- keep it owner-only.
+            _write_private(meta_path, json.dumps(meta))
 
             # Start Unix domain socket server
             server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 server_sock.bind(str(sock_path))
+                # Restrict the socket to the owner so other local users
+                # cannot connect and drive the authenticated session.
+                os.chmod(str(sock_path), 0o600)
                 server_sock.listen(5)
                 server_sock.settimeout(1.0)
 
@@ -3664,7 +3750,8 @@ def _build_main_parser() -> argparse.ArgumentParser:
         "--auth-header",
         action="append",
         default=[],
-        help="HTTP header as Name:Value (repeatable). Value supports env:VAR and file:/path prefixes",
+        help="HTTP header as Name:Value (repeatable). Value supports env:VAR and file:/path prefixes "
+             "(a literal value is visible in process listings; prefer env:/file:)",
     )
     pre.add_argument("--base-url", default=None, help="Override base URL from spec")
     pre.add_argument("--cache-key", default=None, help="Custom cache key")
@@ -3774,7 +3861,8 @@ def _build_main_parser() -> argparse.ArgumentParser:
     pre.add_argument(
         "--oauth-client-secret",
         default=None,
-        help="OAuth client secret — supports env:VAR and file:/path prefixes",
+        help="OAuth client secret — supports env:VAR and file:/path prefixes "
+             "(a literal value is visible in process listings; prefer env:/file:)",
     )
     pre.add_argument(
         "--oauth-client-name",

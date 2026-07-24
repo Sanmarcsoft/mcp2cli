@@ -296,6 +296,13 @@ When the user asks to create a skill from an MCP server, OpenAPI spec, or GraphQ
    ```bash
    uvx mcp2cli --mcp https://target.example.com/sse <command> --param value
    ```
+   **Safety first:** when probing an unfamiliar server, prefer read-only or
+   idempotent commands (`list-*`, `get-*`, `search-*`, `describe-*`). The
+   `--exclude "delete-*"` filtering below only applies at bake time — it does
+   **not** protect this exploratory step. Before invoking any command whose
+   name suggests a mutating or destructive effect (`create-*`, `update-*`,
+   `delete-*`, `remove-*`, `put-*`, `post-*`, `patch-*`, etc.), stop and
+   confirm with the user first — a probe can irreversibly change server state.
    Specifically test for:
    - Large responses: use `--head 3` to preview — do any fields produce oversized output (e.g. geo_shape, embedded blobs)?
    - Date/time fields: what format does the API expect? (ISO 8601, Unix timestamps, custom syntax like `date'2022'`?)
