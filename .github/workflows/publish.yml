@@ -19,9 +19,9 @@ jobs:
         mcp: ["mcp==1.26.0", "mcp<2", "mcp>=2,<3"]
     name: test (py${{ matrix.python }}, ${{ matrix.mcp }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1 (node24)
 
       - run: uv venv --python ${{ matrix.python }}
 
@@ -48,9 +48,9 @@ jobs:
     if: github.event_name == 'push' && github.repository == 'knowsuchagency/mcp2cli'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1 (node24)
 
       - run: uv build
 
