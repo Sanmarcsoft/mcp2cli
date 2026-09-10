@@ -44,7 +44,8 @@ jobs:
 
   publish:
     needs: test
-    if: github.event_name == 'push'
+    # The fork has no PyPI token and must not publish.
+    if: github.event_name == 'push' && github.repository == 'knowsuchagency/mcp2cli'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
