@@ -685,7 +685,7 @@ def load_cached(key: str, ttl: int) -> dict | None:
 
 def save_cache(key: str, data: dict):
     _mkdir_private(CACHE_DIR)
-    (CACHE_DIR / f"{key}.json").write_text(json.dumps(data))
+    _write_private(CACHE_DIR / f"{key}.json", json.dumps(data))
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +706,7 @@ def _load_usage() -> dict:
 def _save_usage(data: dict) -> None:
     """Write usage data. Last-write-wins -- no file locking."""
     _mkdir_private(CACHE_DIR)
-    USAGE_FILE.write_text(json.dumps(data, indent=2))
+    _write_private(USAGE_FILE, json.dumps(data, indent=2))
 
 
 def record_usage(source_hash: str, tool_name: str) -> None:
@@ -1310,7 +1310,7 @@ def build_oauth_provider(
             response_types=["code"],
             scope=scope,
         )
-        storage._client_path.write_text(pre_client_info.model_dump_json())
+        _write_private(storage._client_path, pre_client_info.model_dump_json())
 
     if manual_callback:
         # Nothing on this host can receive the redirect (e.g. a VPS reached
@@ -3565,8 +3565,14 @@ def session_start(
     )
 
     log_path = _session_log_path(name)
-    log_handle = open(log_path, "a")
+    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
+        log_handle = os.fdopen(log_fd, "a")
+    except Exception:
+        os.close(log_fd)
+        raise
+    try:
+        os.chmod(str(log_path), 0o600)
         proc = subprocess.Popen(
             [
                 sys.executable,
