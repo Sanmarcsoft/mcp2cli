@@ -60,6 +60,8 @@ Options:
   --base-url URL          Override base URL from spec
   --transport TYPE        MCP HTTP transport: auto|sse|streamable (default: auto)
   --env KEY=VALUE         Env var for stdio server process (repeatable)
+  --root PATH|FILE_URI   Expose a filesystem root to an MCP server (repeatable)
+  --complete SPEC       Complete an MCP prompt or resource-template argument
   --session-start NAME   Start a persistent session daemon (requires --mcp or --mcp-stdio)
   --session NAME         Route command through an existing session daemon
   --session-stop NAME    Stop a named session daemon (sends SIGTERM)
@@ -68,6 +70,8 @@ Options:
   --oauth-client-id ID    OAuth client ID (supports env:/file: prefixes)
   --oauth-client-secret S OAuth client secret (supports env:/file: prefixes)
   --oauth-scope SCOPE     OAuth scope(s) to request
+  --oauth-manual-callback Print the auth URL and read the redirect URL from stdin
+                          (headless hosts: VPS over SSH, containers)
   --cache-key KEY         Custom cache key
   --cache-ttl SECONDS     Cache TTL (default: 3600)
   --refresh               Bypass cache
@@ -194,6 +198,32 @@ File parameters show `(file path)` in `--help` output. MIME types are auto-detec
 
 ```bash
 mcp2cli --mcp-stdio "node server.js" --env API_KEY=env:API_SECRET_KEY --env DEBUG=1 search --query "test"
+```
+
+### MCP roots and completion
+
+Workspace-scoped servers can request the filesystem roots exposed by the
+client. Repeat `--root`; local paths become `file://` URIs.
+
+```bash
+mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" \
+  --root "$PWD" --root file:///var/shared --list
+```
+
+Ask the server to complete a prompt argument or resource-template variable:
+
+```bash
+mcp2cli --mcp https://example.com/mcp --complete "greeting:name=San"
+mcp2cli --mcp https://example.com/mcp \
+  --complete "file:///docs/{topic}:topic=api"
+```
+
+For persistent connections, pass roots when starting the daemon and route
+completion through the named session:
+
+```bash
+mcp2cli --mcp-stdio "node server.js" --root "$PWD" --session-start workspace
+mcp2cli --session workspace --complete "greeting:name=San"
 ```
 
 ### Session management — persistent MCP connections

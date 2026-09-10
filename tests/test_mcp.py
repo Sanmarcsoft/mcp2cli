@@ -65,6 +65,33 @@ class TestMCPStdio:
         data = json.loads(r.stdout)
         assert data["recursive"] is True
 
+    def test_structured_content_only(self):
+        """A tool returning only structuredContent (empty content list) must
+        still print the payload instead of printing nothing."""
+        # --refresh: the tool list is cached on disk by server command; force a
+        # re-fetch so this test doesn't depend on cache freshness.
+        r = self._run("--refresh", "struct-only")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert data == {"answer": 42}
+
+    def test_reserved_boolean_stdin_property_reaches_tool(self):
+        r = self._run(
+            "--refresh",
+            "reserved-args",
+            "--arg-help",
+            "details",
+            "--arg-stdin-2",
+            "--arg-stdin",
+            "literal",
+        )
+        assert r.returncode == 0
+        assert json.loads(r.stdout) == {
+            "arg_stdin": "literal",
+            "help": "details",
+            "stdin": True,
+        }
+
     def test_echo_stdin(self):
         r = self._run("echo", "--stdin", stdin_data='{"message": "from stdin"}')
         assert r.returncode == 0
@@ -168,6 +195,23 @@ class TestMCPStdio:
         r2 = self._run("echo", "--message", "second")
         assert r2.returncode == 0
 
+    # --- Tool failures (isError) ---
+
+    def test_iserror_tool_exits_nonzero(self):
+        """A tool result with isError=true must exit non-zero, on stderr."""
+        r = self._run("fail")
+        assert r.returncode != 0
+        assert "boom: deliberate failure" in r.stderr
+        assert "boom: deliberate failure" not in r.stdout
+
+    def test_iserror_tool_json_keeps_envelope_but_exits_nonzero(self):
+        """--json still emits the full envelope, but the exit code reflects failure."""
+        r = self._run("--json", "fail")
+        assert r.returncode != 0
+        envelope = json.loads(r.stdout)
+        assert envelope["isError"] is True
+        assert envelope["content"][0]["text"] == "boom: deliberate failure"
+
     # --- Resources ---
 
     def test_list_resources(self):
@@ -218,56 +262,47 @@ class TestMCPStdio:
         # Default name should be "World"
         assert "World" in data["messages"][0]["content"]
 
+    # --- Roots and completion ---
+
+    def test_roots_are_exposed_to_server(self):
+        r = self._run(
+            "--refresh",
+            "--root",
+            "/tmp/workspace",
+            "--root",
+            "file:///var/project",
+            "client-roots",
+        )
+        assert r.returncode == 0
+        roots = json.loads(r.stdout)
+        assert {root["uri"] for root in roots} == {
+            "file:///tmp/workspace",
+            "file:///var/project",
+        }
+        assert {root["name"] for root in roots} == {"workspace", "project"}
+
+    def test_invalid_root_uri_fails_before_connecting(self):
+        r = self._run("--root", "https://example.com/workspace", "--list")
+        assert r.returncode != 0
+        assert "--root expects a filesystem path or file:// URI" in r.stderr
+
+    def test_complete_prompt_argument(self):
+        r = self._run("--complete", "greeting:name=San")
+        assert r.returncode == 0
+        assert json.loads(r.stdout) == {
+            "values": ["San Diego", "San Francisco"],
+            "total": 3,
+            "hasMore": True,
+        }
+
 
 class TestMCPHTTP:
     """Tests for MCP HTTP transport.
 
-    These use a subprocess-based MCP HTTP server started as a fixture.
-    We test the tool listing and invocation via streamable HTTP / SSE.
+    Driven against the Streamable HTTP test server (`mcp_http_server` in
+    conftest), which is deliberately POST-only.
     """
 
-    @pytest.fixture(scope="class")
-    def mcp_http_server(self):
-        """Start an MCP HTTP server for testing.
-
-        Uses the `mcp` package's built-in HTTP server capabilities.
-        """
-        server_script = Path(__file__).parent / "_mcp_http_server.py"
-        if not server_script.exists():
-            # Create a minimal MCP HTTP server script
-            server_script.write_text(_MCP_HTTP_SERVER_SCRIPT)
-
-        proc = subprocess.Popen(
-            [sys.executable, str(server_script)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        # Wait for server to be ready by reading the port from stdout
-        import time
-
-        port = None
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            line = proc.stdout.readline().strip()
-            if line.startswith("PORT="):
-                port = int(line.split("=")[1])
-                break
-            if proc.poll() is not None:
-                stderr = proc.stderr.read()
-                pytest.skip(f"MCP HTTP server failed to start: {stderr}")
-                return
-
-        if port is None:
-            proc.kill()
-            pytest.skip("MCP HTTP server did not report port in time")
-            return
-
-        url = f"http://127.0.0.1:{port}/sse"
-        yield url
-        proc.terminate()
-        proc.wait(timeout=5)
 
     def _run(self, url, *args) -> subprocess.CompletedProcess:
         cmd = [
@@ -294,6 +329,16 @@ class TestMCPHTTP:
         r = self._run(mcp_http_server, "add-numbers", "--a", "10", "--b", "20")
         assert r.returncode == 0
         assert "30" in r.stdout
+
+    def test_iserror_http_exits_nonzero(self, mcp_http_server):
+        plain = self._run(mcp_http_server, "fail")
+        assert plain.returncode != 0
+        assert "boom: deliberate failure" in plain.stderr
+        assert plain.stdout == ""
+
+        machine = self._run(mcp_http_server, "--json", "fail")
+        assert machine.returncode != 0
+        assert json.loads(machine.stdout)["isError"] is True
 
     # --- Resources (HTTP) ---
 
@@ -349,6 +394,10 @@ class TestSessions:
                 "mcp2cli",
                 "--mcp-stdio",
                 server,
+                "--root",
+                "/tmp/workspace",
+                "--root",
+                "file:///var/project",
                 "--session-start",
                 name,
             ],
@@ -429,6 +478,49 @@ class TestSessions:
             data = json.loads(r.stdout)
             assert any(d["name"] == "greeting" for d in data)
 
+            # Completion via session
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "--complete",
+                    "greeting:name=San",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode == 0
+            assert json.loads(r.stdout) == {
+                "values": ["San Diego", "San Francisco"],
+                "total": 3,
+                "hasMore": True,
+            }
+
+            # Roots survive serialization into the session daemon
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "client-roots",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode == 0
+            roots = json.loads(r.stdout)
+            assert {root["uri"] for root in roots} == {
+                "file:///tmp/workspace",
+                "file:///var/project",
+            }
+
         finally:
             # Stop
             r = subprocess.run(
@@ -448,5 +540,180 @@ class TestSessions:
         )
         assert name not in r.stdout or "dead" in r.stdout
 
+    def test_session_iserror_tool_exits_nonzero(self):
+        """isError through the session daemon must also exit non-zero."""
+        server = f"{sys.executable} {MCP_SERVER}"
+        name = "test-iserror"
 
-_MCP_HTTP_SERVER_SCRIPT = ""  # Server script is now in _mcp_http_server.py
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mcp2cli",
+                "--mcp-stdio",
+                server,
+                "--session-start",
+                name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert r.returncode == 0
+
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "mcp2cli", "--session", name, "fail"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode != 0
+            assert "boom: deliberate failure" in r.stderr
+            assert "boom: deliberate failure" not in r.stdout
+
+            machine = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--json",
+                    "--session",
+                    name,
+                    "fail",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert machine.returncode != 0
+            assert json.loads(machine.stdout)["isError"] is True
+
+            structured = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "struct-only",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert structured.returncode == 0
+            assert json.loads(structured.stdout) == {"answer": 42}
+
+            # Successful calls still print to stdout and exit 0.
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp2cli",
+                    "--session",
+                    name,
+                    "echo",
+                    "--message",
+                    "still fine",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert r.returncode == 0
+            assert "still fine" in r.stdout
+        finally:
+            subprocess.run(
+                [sys.executable, "-m", "mcp2cli", "--session-stop", name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+class TestConnectionErrors:
+    """Transport failures must report one clean error line, not a traceback."""
+
+    def _run(self, *args):
+        import os
+
+        env = {key: value for key, value in os.environ.items() if key != "MCP2CLI_DEBUG"}
+        return subprocess.run(
+            [sys.executable, "-m", "mcp2cli", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+
+    def test_unreachable_server_is_one_clean_line(self):
+        r = self._run(
+            "--mcp", "http://127.0.0.1:9/mcp", "--list", "--transport", "streamable"
+        )
+        assert r.returncode != 0
+        assert "Traceback" not in r.stderr
+        assert "Error: cannot use MCP server at http://127.0.0.1:9/mcp" in r.stderr
+        assert r.stdout == ""
+
+    def test_auth_rejection_hints_at_credentials(self):
+        """A 401/403 should suggest --auth-header instead of dumping a traceback."""
+        import http.server
+        import threading
+
+        class Deny(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(401)
+                self.end_headers()
+
+            def do_POST(self):
+                self.send_response(401)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Deny)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            r = self._run("--mcp", f"http://127.0.0.1:{port}/mcp", "--list")
+            assert r.returncode != 0
+            assert "Traceback" not in r.stderr
+            assert "--auth-header" in r.stderr
+            assert len(r.stderr.splitlines()) == 1
+        finally:
+            server.shutdown()
+
+    def test_grouped_system_exit_preserves_code(self):
+        import anyio
+
+        from mcp2cli import _run_mcp_clean
+
+        async def exit_inside_task_group():
+            async with anyio.create_task_group():
+                raise SystemExit(3)
+
+        with pytest.raises(SystemExit) as caught:
+            _run_mcp_clean(exit_inside_task_group, "test")
+        assert caught.value.code == 3
+
+    def test_debug_env_restores_traceback(self):
+        import os
+
+        env = {**os.environ, "MCP2CLI_DEBUG": "1"}
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "mcp2cli",
+                "--mcp", "http://127.0.0.1:9/mcp", "--list",
+                "--transport", "streamable",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        assert r.returncode != 0
+        assert "Traceback" in r.stderr

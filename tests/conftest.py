@@ -1258,3 +1258,40 @@ def graphql_server():
 def graphql_schema():
     """Return the GraphQL introspection schema dict."""
     return GRAPHQL_SCHEMA
+
+
+@pytest.fixture(scope="session")
+def mcp_http_server():
+    """Start the Streamable HTTP MCP test server for the whole session.
+
+    Yields the endpoint URL. A startup failure is a hard error, not a skip:
+    silently skipping is how streamable-http coverage disappeared exactly when
+    an SDK upgrade broke that transport (issues #68, #74).
+    """
+    import subprocess
+    import time
+
+    script = Path(__file__).parent / "_mcp_http_server.py"
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    port = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"MCP HTTP server exited: {proc.stderr.read()}")
+        line = proc.stdout.readline().strip()
+        if line.startswith("PORT="):
+            port = int(line.split("=")[1])
+            break
+    if port is None:
+        proc.kill()
+        raise RuntimeError("MCP HTTP server did not report a port within 10s")
+    try:
+        yield f"http://127.0.0.1:{port}/mcp"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)

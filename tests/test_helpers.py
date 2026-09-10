@@ -1,6 +1,7 @@
 """Tests for helper functions and data structures."""
 
 import argparse
+import asyncio
 import json
 import shutil
 
@@ -9,7 +10,9 @@ from mcp2cli import (
     CommandDef,
     _apply_head,
     _collect_openapi_params,
+    _extract_content_parts,
     _find_toon_cli,
+    _list_all_tools,
     _split_at_subcommand,
     _toon_encode,
     cache_key_for,
@@ -51,6 +54,27 @@ class TestSchemaTypeToPython:
     def test_missing_type(self):
         assert schema_type_to_python({}) == (str, "")
 
+    def test_union_type_array_form(self):
+        # JSON Schema allows "type": ["integer", "null"]
+        assert schema_type_to_python({"type": ["integer", "null"]}) == (int, "")
+        assert schema_type_to_python({"type": ["number", "null"]}) == (float, "")
+        assert schema_type_to_python({"type": ["string", "null"]}) == (str, "")
+
+    def test_missing_type_int_enum_inferred(self):
+        # No "type" but a numeric enum: argparse must parse the flag as int or
+        # it rejects the value against numeric choices.
+        assert schema_type_to_python({"enum": [1, 2, 3]}) == (int, "")
+
+    def test_missing_type_float_enum_inferred(self):
+        assert schema_type_to_python({"enum": [0.5, 1.5]}) == (float, "")
+
+    def test_missing_type_string_enum_stays_str(self):
+        assert schema_type_to_python({"enum": ["a", "b"]}) == (str, "")
+
+    def test_missing_type_bool_enum_not_inferred(self):
+        # bool is a subclass of int; don't misread a bool enum as int
+        assert schema_type_to_python({"enum": [True, False]}) == (str, "")
+
 
 class TestCoerceValue:
     def test_none(self):
@@ -61,6 +85,18 @@ class TestCoerceValue:
 
     def test_number(self):
         assert coerce_value("3.14", {"type": "number"}) == 3.14
+
+    def test_union_type_array_form(self):
+        # "type": ["integer", "null"] must still coerce to int
+        assert coerce_value("42", {"type": ["integer", "null"]}) == 42
+        assert coerce_value("3.14", {"type": ["number", "null"]}) == 3.14
+
+    def test_array_items_union_type(self):
+        schema = {
+            "type": "array",
+            "items": {"type": ["integer", "null"]},
+        }
+        assert coerce_value("1,2", schema) == [1, 2]
 
     def test_boolean(self):
         assert coerce_value(True, {"type": "boolean"}) is True
@@ -217,20 +253,27 @@ class TestApplyHead:
 
 
 class TestToonEncode:
+    def test_find_toon_cli_prefers_installed_binary(self, monkeypatch):
+        """A real `toon` on PATH is used directly, without involving npx."""
+        monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+        assert _find_toon_cli() == ("toon",)
+
     def test_find_toon_cli_npx(self, monkeypatch):
-        """Falls back to npx when toon binary isn't in PATH."""
-        original_which = shutil.which
-        def mock_which(cmd):
-            if cmd == "toon":
-                return None
-            return original_which(cmd)
-        monkeypatch.setattr(shutil, "which", mock_which)
-        result = _find_toon_cli()
-        # Either npx is available or None
-        if shutil.which("npx") is not None:
-            assert result == "npx @toon-format/cli"
-        else:
-            assert result is None
+        """Falls back to npx when the toon binary isn't in PATH.
+
+        The npx form must pass --no: without it npx silently downloads the
+        package from the registry mid-command, so --toon becomes a multi-second
+        network fetch racing _toon_encode's timeout.
+        """
+        monkeypatch.setattr(
+            shutil, "which", lambda cmd: None if cmd == "toon" else f"/usr/bin/{cmd}"
+        )
+        assert _find_toon_cli() == ("npx", "--no", "@toon-format/cli")
+
+    def test_find_toon_cli_absent(self, monkeypatch):
+        """No toon binary and no npx means no TOON support."""
+        monkeypatch.setattr(shutil, "which", lambda cmd: None)
+        assert _find_toon_cli() is None
 
     def test_toon_encode_uniform_array(self):
         """TOON CLI encodes a uniform array into tabular format."""
@@ -423,6 +466,85 @@ class TestExtractMCPCommands:
         assert cmds[0].name == "list-items"
         assert cmds[0].tool_name == "list_items"
 
+    def test_kebab_collision_deduplicated(self):
+        """get_user + getUser both kebab to get-user; argparse would raise
+        'conflicting subparser' and brick the CLI. Names must be unique while
+        tool_name keeps the original wire name."""
+        tools = [
+            {"name": "get_user", "description": "snake", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "getUser", "description": "camel", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "get-user", "description": "kebab", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        cmds = extract_mcp_commands(tools)
+        names = [c.name for c in cmds]
+        assert len(set(names)) == 3
+        assert [c.tool_name for c in cmds] == ["get_user", "getUser", "get-user"]
+
+    def test_collision_aliases_are_stable_and_preserve_natural_names(self):
+        tools = [
+            {"name": "get_user", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "getUser", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "get_user_2", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        first = {cmd.tool_name: cmd.name for cmd in extract_mcp_commands(tools)}
+        reordered = {
+            cmd.tool_name: cmd.name for cmd in extract_mcp_commands(list(reversed(tools)))
+        }
+        assert first == reordered
+        assert first["get_user_2"] == "get-user-2"
+
+
+class TestBuildArgparseReservedFlags:
+    """A tool property named help/stdin used to raise 'conflicting option
+    string' during parser build, killing every command on that server."""
+
+    def _build(self, props):
+        from mcp2cli import build_argparse
+
+        tools = [
+            {
+                "name": "weird",
+                "description": "reserved props",
+                "inputSchema": {"type": "object", "properties": props},
+            }
+        ]
+        pre = argparse.ArgumentParser(add_help=False)
+        return build_argparse(extract_mcp_commands(tools), pre)
+
+    def test_help_property_does_not_brick_parser(self):
+        parser = self._build({"help": {"type": "string"}})
+        args = parser.parse_args(["weird", "--arg-help", "h1"])
+        assert args.arg_help == "h1"
+
+    def test_stdin_property_has_distinct_destination(self):
+        parser = self._build({"stdin": {"type": "string"}})
+        args = parser.parse_args(["weird", "--arg-stdin", "s1"])
+        assert args.stdin is False
+        assert args.arg_stdin == "s1"
+
+        stdin_args = parser.parse_args(["weird", "--stdin"])
+        assert stdin_args.stdin is True
+        assert stdin_args.arg_stdin is None
+
+    def test_boolean_stdin_property_does_not_trigger_stdin_mode(self):
+        parser = self._build({"stdin": {"type": "boolean"}})
+        args = parser.parse_args(["weird", "--arg-stdin"])
+        assert args.stdin is False
+        assert args.arg_stdin is True
+
+    def test_reserved_alias_does_not_shadow_natural_property(self):
+        parser = self._build(
+            {
+                "help": {"type": "string"},
+                "arg_help": {"type": "string"},
+            }
+        )
+        args = parser.parse_args(
+            ["weird", "--arg-help-2", "reserved", "--arg-help", "natural"]
+        )
+        assert args.arg_help_2 == "reserved"
+        assert args.arg_help == "natural"
+
 
 class TestSplitAtSubcommand:
     """Tests for _split_at_subcommand() — GH #15."""
@@ -609,3 +731,82 @@ class TestCollectOpenAPIParams:
         args = argparse.Namespace(args='{"key": "value"}', stdin=False)
         _, _, _, body, _ = _collect_openapi_params(cmd, args)
         assert body == {"args": {"key": "value"}}
+
+
+class _FakePage:
+    def __init__(self, tools, next_cursor=None):
+        self.tools = tools
+        self.nextCursor = next_cursor
+
+
+class _FakeSession:
+    """Fake MCP session whose list_tools() serves canned pages, keyed by cursor.
+
+    Mirrors the real signature: both SDK majors take pagination as
+    ``params=PaginatedRequestParams(...)``; v1's ``cursor=`` shorthand is
+    deprecated and v2 removed it.
+    """
+
+    def __init__(self, pages):
+        # pages: list of (cursor_expected, _FakePage) in order
+        self._pages = pages
+        self.calls = []
+
+    async def list_tools(self, *, params=None):
+        cursor = params.cursor if params is not None else None
+        self.calls.append(cursor)
+        expected_cursor, page = self._pages[len(self.calls) - 1]
+        assert cursor == expected_cursor, (
+            f"call {len(self.calls)}: expected cursor={expected_cursor!r}, got {cursor!r}"
+        )
+        return page
+
+
+class TestListAllTools:
+    def test_single_page_no_cursor(self):
+        """A server that never sets nextCursor is fetched in exactly one call."""
+        session = _FakeSession([(None, _FakePage(["a", "b"], next_cursor=None))])
+        tools = asyncio.run(_list_all_tools(session))
+        assert tools == ["a", "b"]
+        assert session.calls == [None]
+
+    def test_follows_next_cursor_across_pages(self):
+        """A paginated server's tools are all collected across multiple calls."""
+        session = _FakeSession(
+            [
+                (None, _FakePage(["a", "b"], next_cursor="page2")),
+                ("page2", _FakePage(["c", "d"], next_cursor="page3")),
+                ("page3", _FakePage(["e"], next_cursor=None)),
+            ]
+        )
+        tools = asyncio.run(_list_all_tools(session))
+        assert tools == ["a", "b", "c", "d", "e"]
+        assert session.calls == [None, "page2", "page3"]
+
+    def test_empty_result(self):
+        session = _FakeSession([(None, _FakePage([], next_cursor=None))])
+        tools = asyncio.run(_list_all_tools(session))
+        assert tools == []
+
+
+class TestExtractContentParts:
+    def test_resource_link_block_is_rendered(self):
+        """resource_link blocks carry only uri/name and must not be dropped."""
+        from types import SimpleNamespace
+
+        text_block = SimpleNamespace(text="see:")
+        link = SimpleNamespace(uri="probe://linked", name="linked-doc")
+        assert _extract_content_parts([text_block, link]) == "see:\nlinked-doc: probe://linked"
+
+    def test_resource_link_without_name(self):
+        from types import SimpleNamespace
+
+        link = SimpleNamespace(uri="probe://linked")
+        assert _extract_content_parts([link]) == "probe://linked"
+
+    def test_serialized_content_blocks_are_rendered(self):
+        blocks = [
+            {"type": "text", "text": "see:"},
+            {"type": "resource_link", "uri": "probe://linked", "name": "linked-doc"},
+        ]
+        assert _extract_content_parts(blocks) == "see:\nlinked-doc: probe://linked"

@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import webbrowser
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -37,6 +38,8 @@ CACHE_DIR = Path(
     os.environ.get("MCP2CLI_CACHE_DIR", Path.home() / ".cache" / "mcp2cli")
 )
 DEFAULT_CACHE_TTL = 3600
+# Client-side capability the user opted into (see --root).
+_ROOTS: list[str] = []
 USAGE_FILE = CACHE_DIR / "usage.json"
 CONFIG_DIR = Path(
     os.environ.get("MCP2CLI_CONFIG_DIR", Path.home() / ".config" / "mcp2cli")
@@ -94,6 +97,7 @@ class ParamDef:
     choices: list | None = None
     location: str = "body"  # path|query|header|body|tool_input
     schema: dict = field(default_factory=dict)
+    cli_name: str | None = None  # collision-free argparse flag name
 
 
 @dataclass
@@ -119,6 +123,18 @@ class BakeConfig:
     include: list[str] = field(default_factory=list)
     exclude: list[str] = field(default_factory=list)
     methods: list[str] = field(default_factory=list)
+    prog: str | None = None
+    description: str | None = None
+
+
+_DEFAULT_PARSER_DESCRIPTION = "Turn any MCP server or OpenAPI spec into a CLI"
+
+
+def _parser_branding(bake_config: BakeConfig | None) -> tuple[str, str]:
+    if bake_config is not None and bake_config.prog is not None:
+        description = bake_config.description or _DEFAULT_PARSER_DESCRIPTION
+        return bake_config.prog, description
+    return "mcp2cli", _DEFAULT_PARSER_DESCRIPTION
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +223,17 @@ def read_stdin_json(context: str):
         sys.exit(1)
 
 
+def _normalize_schema_type(t):
+    """JSON Schema allows "type": ["integer", "null"] (array form). Reduce it
+    to the single concrete type, dropping "null"; anything else passes through."""
+    if isinstance(t, list):
+        concrete = [x for x in t if x != "null"]
+        return concrete[0] if len(concrete) == 1 else None
+    return t
+
+
 def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
-    t = schema.get("type")
+    t = _normalize_schema_type(schema.get("type"))
     if t == "integer":
         return int, ""
     if t == "number":
@@ -219,6 +244,16 @@ def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
         return str, " (JSON array)"
     if t == "object":
         return str, " (JSON object)"
+    if t is None:
+        # No "type" but an enum: infer the argparse type from the values, so
+        # numeric enums stay callable (otherwise argparse parses the flag as a
+        # string and rejects it against numeric choices).
+        enum = schema.get("enum")
+        if enum and not any(isinstance(v, bool) for v in enum):
+            if all(isinstance(v, int) for v in enum):
+                return int, ""
+            if all(isinstance(v, (int, float)) for v in enum):
+                return float, ""
     return str, ""
 
 
@@ -236,7 +271,7 @@ def _coerce_item(value: str, item_type: str | None):
 def coerce_value(value, schema: dict):
     if value is None:
         return None
-    t = schema.get("type")
+    t = _normalize_schema_type(schema.get("type"))
     if t == "array":
         if isinstance(value, list):
             return value
@@ -247,7 +282,7 @@ def coerce_value(value, schema: dict):
                     return parsed
             except (json.JSONDecodeError, TypeError):
                 pass
-            item_type = schema.get("items", {}).get("type")
+            item_type = _normalize_schema_type(schema.get("items", {}).get("type"))
             if "," in value:
                 return [_coerce_item(v.strip(), item_type) for v in value.split(",")]
             return [_coerce_item(value, item_type)]
@@ -281,13 +316,16 @@ def to_kebab(name: str) -> str:
     return s.replace("_", "-").lower()
 
 
-def _find_toon_cli() -> str | None:
-    """Return the command to invoke the TOON CLI, or None if unavailable."""
+def _find_toon_cli() -> tuple[str, ...] | None:
+    """Return argv for the TOON CLI, or None if unavailable."""
     if shutil.which("toon"):
-        return "toon"
-    # Check for npx (ships with Node.js)
+        return ("toon",)
+    # npx ships with Node.js, but having it says nothing about the package.
+    # `--no` forbids npx's implicit registry download, so a missing package
+    # fails in about a second instead of turning --toon into a network fetch
+    # racing the timeout in _toon_encode.
     if shutil.which("npx"):
-        return "npx @toon-format/cli"
+        return ("npx", "--no", "@toon-format/cli")
     return None
 
 
@@ -298,7 +336,7 @@ def _toon_encode(json_str: str) -> str | None:
         return None
     try:
         result = subprocess.run(
-            cmd.split(),
+            cmd,
             input=json_str,
             capture_output=True,
             text=True,
@@ -309,6 +347,150 @@ def _toon_encode(json_str: str) -> str | None:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# MCP SDK compatibility (v1 and v2)
+# ---------------------------------------------------------------------------
+
+# SDK 2.0 renamed model fields from camelCase to snake_case, keeping camelCase
+# only as serialization aliases -- so attribute access has to use the new name
+# while the wire format is unchanged. A name missing from this map is an
+# unhandled rename and raises KeyError rather than silently reading None.
+_MCP_RENAMED_FIELDS = {
+    "inputSchema": "input_schema",
+    "outputSchema": "output_schema",
+    "nextCursor": "next_cursor",
+    "resourceTemplates": "resource_templates",
+    "uriTemplate": "uri_template",
+    "mimeType": "mime_type",
+    "structuredContent": "structured_content",
+    "isError": "is_error",
+    "hasMore": "has_more",
+}
+
+
+def _mcp_attr(obj, name: str):
+    """Read an SDK model field across the v1/v2 camelCase -> snake_case rename."""
+    try:
+        return getattr(obj, name)
+    except AttributeError:
+        return getattr(obj, _MCP_RENAMED_FIELDS[name])
+
+
+def _demote_meta_alias(node: dict) -> None:
+    """Emit the SDK's ``_meta`` alias as ``meta``, the spelling mcp2cli ships."""
+    if "_meta" in node:
+        node["meta"] = node.pop("_meta")
+
+
+def _mcp_dump(model) -> dict:
+    """Serialize an SDK model using the camelCase wire names on either major.
+
+    v2 renamed model attributes to snake_case, so a plain ``model_dump()``
+    would silently change mcp2cli's ``--json`` envelope from ``isError`` to
+    ``is_error`` depending on which SDK happened to be installed. ``by_alias``
+    pins the wire spelling on both.
+
+    ``meta`` is aliased to ``_meta`` in both majors, and mcp2cli has always
+    emitted it as ``meta``, so it is mapped back -- but only on the envelope
+    and its content items, which the SDK owns. ``structuredContent`` is the
+    tool's own payload and is never rewritten, so a tool that legitimately
+    returns a ``_meta`` key keeps it.
+    """
+    data = model.model_dump(mode="json", by_alias=True)
+    _demote_meta_alias(data)
+    for item in data.get("content") or ():
+        if isinstance(item, dict):
+            _demote_meta_alias(item)
+    return data
+
+
+def _resource_uri(uri: str):
+    """Coerce a resource URI to what ``resources/read`` expects.
+
+    v1 types the request param as a pydantic ``AnyUrl``; v2 takes a plain
+    string and rejects an ``AnyUrl``.
+    """
+    from mcp.types import ReadResourceRequestParams
+
+    if ReadResourceRequestParams.model_fields["uri"].annotation is str:
+        return uri
+    from pydantic import AnyUrl
+
+    return AnyUrl(uri)
+
+
+@asynccontextmanager
+async def _streamable_streams(url: str, headers=None, auth=None):
+    """Open a streamable-http transport, yielding ``(read, write)``.
+
+    Three things differ across SDK majors here, which is why this is the only
+    place that talks to that transport (issues #68, #74):
+
+    * v2 dropped the ``streamablehttp_client`` alias, keeping only
+      ``streamable_http_client`` -- the original break.
+    * that surviving function takes a pre-built ``http_client`` instead of
+      ``headers``/``auth``, and v2 is built on **httpx2**, not httpx, so the
+      client has to come from the SDK's own factory to be the right flavour.
+    * v1 yields a third element (a get-session-id callback) that v2 dropped.
+      mcp2cli never used it, so both shapes collapse to ``(read, write)``.
+    """
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    async with create_mcp_http_client(headers=headers, auth=auth) as client:
+        async with streamable_http_client(url, http_client=client) as streams:
+            yield streams[0], streams[1]
+
+
+async def _list_tools_page(session, cursor: str | None):
+    """Request one page of ``tools/list``.
+
+    Both majors accept ``params``; v1's ``cursor=`` shorthand is deprecated
+    there and gone in v2, so this is the one spelling that works on both.
+    """
+    from mcp.types import PaginatedRequestParams
+
+    params = PaginatedRequestParams(cursor=cursor) if cursor else None
+    return await session.list_tools(params=params)
+
+
+def _authorization_code_result(code: str, state: str | None):
+    """Wrap a callback result in whatever ``callback_handler`` must return.
+
+    v1 expects a plain ``(code, state)`` tuple; v2 expects an
+    ``AuthorizationCodeResult`` model.
+    """
+    try:
+        from mcp.shared.auth import AuthorizationCodeResult
+    except ImportError:
+        return (code, state)
+    return AuthorizationCodeResult(code=code, state=state)
+
+
+def _ensure_utf8_output() -> None:
+    """Make non-ASCII output safe on consoles that cannot encode it.
+
+    JSON is emitted with ``ensure_ascii=False`` (issue #62), so CJK and emoji
+    reach stdout as real characters instead of ``\\uXXXX``. On a stream whose
+    encoding cannot represent them -- a redirected pipe under a legacy
+    Windows code page such as cp936 -- ``print()`` would raise
+    ``UnicodeEncodeError`` where the old escaped output was merely ugly.
+    Prefer UTF-8; if the stream refuses to be reconfigured, degrade to
+    backslash escapes, i.e. the pre-#62 shape, rather than crashing.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            try:
+                reconfigure(errors="backslashreplace")
+            except Exception:
+                pass
 
 
 
@@ -322,9 +504,9 @@ def _apply_head(data, n: int):
 def _emit_json(data, pretty: bool = False) -> None:
     """Print *data* as JSON. Indented when *pretty* or stdout is a TTY, else compact."""
     if pretty or sys.stdout.isatty():
-        print(json.dumps(data, indent=2))
+        print(json.dumps(data, indent=2, ensure_ascii=False))
     else:
-        print(json.dumps(data))
+        print(json.dumps(data, ensure_ascii=False))
 
 
 def output_result(
@@ -354,7 +536,7 @@ def output_result(
         if isinstance(data, str):
             print(data)
         else:
-            print(json.dumps(data))
+            print(json.dumps(data, ensure_ascii=False))
         return
     if isinstance(data, str):
         try:
@@ -365,7 +547,7 @@ def output_result(
     if head is not None:
         data = _apply_head(data, head)
     if toon:
-        encoded = _toon_encode(json.dumps(data))
+        encoded = _toon_encode(json.dumps(data, ensure_ascii=False))
         if encoded is not None:
             print(encoded, end="")
             return
@@ -385,9 +567,34 @@ def _python_type_name(t: type | None) -> str:
     return getattr(t, "__name__", str(t))
 
 
+def _param_dest(p: "ParamDef") -> str:
+    """Return the argparse destination allocated for a parameter."""
+    return (p.cli_name or p.name).replace("-", "_")
+
+
+def _allocate_param_cli_names(cmd: "CommandDef") -> None:
+    """Assign unique parameter flags without shadowing built-in options."""
+    natural_names = {p.name for p in cmd.params}
+    used = {"help"}
+    if cmd.has_body:
+        used.add("stdin")
+
+    for p in cmd.params:
+        name = p.name
+        if name in used:
+            stem = f"arg-{name}"
+            name = stem
+            suffix = 2
+            while name in used or name in natural_names:
+                name = f"{stem}-{suffix}"
+                suffix += 1
+        p.cli_name = name
+        used.add(name)
+
+
 def _param_to_dict(p: "ParamDef") -> dict:
     d = {
-        "name": p.name,
+        "name": p.cli_name or p.name,
         "type": _python_type_name(p.python_type),
         "required": p.required,
         "description": p.description,
@@ -713,6 +920,63 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _parse_oauth_callback_input(text: str) -> tuple[str, str]:
+    """Extract ``(code, state)`` from a pasted OAuth callback URL.
+
+    Accepts the full redirect target the browser landed on
+    (``http://127.0.0.1:1234/callback?code=...&state=...``) or just its query
+    string. PKCE and CSRF verification stay in the MCP SDK -- we only hand it
+    the two values it asks for. The SDK compares ``state`` against the one it
+    generated with ``secrets.compare_digest`` and treats ``None`` as a
+    mismatch, so a paste missing ``state`` is rejected here with a readable
+    message instead of surfacing as an opaque
+    ``State parameter mismatch: None != ...``.
+    """
+    text = text.strip().strip("'\"")
+    if not text:
+        raise ValueError("No callback URL provided.")
+    params = parse_qs(urlparse(text).query or text)
+    if "error" in params:
+        detail = params.get("error_description", [""])[0]
+        suffix = f" ({detail})" if detail else ""
+        raise RuntimeError(f"OAuth error: {params['error'][0]}{suffix}")
+    if "code" not in params:
+        raise ValueError(
+            "That URL has no 'code' parameter. Paste the entire URL from the "
+            "browser's address bar, including everything after the '?'."
+        )
+    if "state" not in params:
+        raise ValueError(
+            "That URL has no 'state' parameter. Paste the URL unmodified -- "
+            "the MCP SDK verifies state to prevent CSRF and rejects a missing one."
+        )
+    return params["code"][0], params["state"][0]
+
+
+def _prompt_oauth_callback(attempts: int = 3) -> tuple[str, str]:
+    """Read the OAuth callback URL from stdin.
+
+    For hosts with no reachable browser -- a VPS over SSH, a container.
+    Blocking, so callers run it off the event loop via ``anyio.to_thread``.
+    A malformed paste is re-prompted rather than fatal: the authorization
+    code is still live, and losing it would mean restarting the whole flow.
+    """
+    for remaining in reversed(range(attempts)):
+        print("Paste the full callback URL here: ", end="", file=sys.stderr, flush=True)
+        line = sys.stdin.readline()
+        if not line:
+            raise RuntimeError(
+                "stdin closed before an OAuth callback URL was pasted; "
+                "--oauth-manual-callback needs an interactive terminal."
+            )
+        try:
+            return _parse_oauth_callback_input(line)
+        except ValueError as exc:
+            if not remaining:
+                raise
+            print(f"{exc} ({remaining} attempt(s) left)", file=sys.stderr)
+
+
 
 
 def _get_cached_redirect_uri(storage: "FileTokenStorage") -> str | None:
@@ -778,6 +1042,7 @@ def build_oauth_provider(
     scope: str | None = None,
     redirect_uri: str | None = None,
     flow: str = "auto",
+    manual_callback: bool = False,
 ) -> "httpx.Auth":
     """Build an OAuth provider for HTTP connections.
 
@@ -796,6 +1061,10 @@ def build_oauth_provider(
 
     redirect_uri controls the full callback URL (scheme, host, port, path).
     When None, defaults to http://127.0.0.1:<random-free-port>/callback.
+
+    manual_callback skips the local callback server entirely and reads the
+    redirect URL from stdin instead, for hosts where the browser runs on a
+    different machine (issue #71).
     """
     storage = FileTokenStorage(server_url)
 
@@ -824,12 +1093,21 @@ def build_oauth_provider(
                 await super()._initialize()
                 _restore_token_expiry_from_sidecar(self.context)
 
+        # v2 renamed the `scopes` argument to `scope`.
+        import inspect
+
+        scope_kwarg = (
+            "scope"
+            if "scope"
+            in inspect.signature(ClientCredentialsOAuthProvider.__init__).parameters
+            else "scopes"
+        )
         return _RobustClientCredentialsProvider(
             server_url=server_url,
             storage=storage,
             client_id=client_id,
             client_secret=client_secret,
-            scopes=scope,
+            **{scope_kwarg: scope},
         )
 
     from mcp.client.auth.oauth2 import OAuthClientProvider
@@ -1034,41 +1312,65 @@ def build_oauth_provider(
         )
         storage._client_path.write_text(pre_client_info.model_dump_json())
 
-    # Reset callback handler state
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.state = None
-    _CallbackHandler.error = None
-    _CallbackHandler.done = threading.Event()
+    if manual_callback:
+        # Nothing on this host can receive the redirect (e.g. a VPS reached
+        # over SSH), so print the URL for a browser elsewhere and take the
+        # redirect back by hand. The loopback redirect_uri is still what gets
+        # registered and sent, so the remote browser's final URL carries
+        # code+state even though no listener exists on that port. (Issue #71.)
+        async def redirect_handler(auth_url: str) -> None:
+            print(
+                "Open this URL in a browser on any machine and authorize:",
+                file=sys.stderr,
+            )
+            print(f"\n{auth_url}\n", file=sys.stderr)
+            print(
+                "The page you land on will fail to load -- that is expected, "
+                "nothing is listening there. Only its URL matters.",
+                file=sys.stderr,
+            )
 
-    if callback_host == "::1":
-        import socket as _socket
-
-        class _IPv6HTTPServer(HTTPServer):
-            address_family = _socket.AF_INET6
-
-        server = _IPv6HTTPServer((callback_host, port), _CallbackHandler)
+        async def callback_handler():
+            code, state = await anyio.to_thread.run_sync(_prompt_oauth_callback)
+            return _authorization_code_result(code, state)
     else:
-        server = HTTPServer((callback_host, port), _CallbackHandler)
+        # Reset callback handler state
+        _CallbackHandler.auth_code = None
+        _CallbackHandler.state = None
+        _CallbackHandler.error = None
+        _CallbackHandler.done = threading.Event()
 
-    async def redirect_handler(auth_url: str) -> None:
-        print("Opening browser for authorization...", file=sys.stderr)
-        print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
-        webbrowser.open(auth_url)
+        if callback_host == "::1":
+            import socket as _socket
 
-    async def callback_handler() -> tuple[str, str | None]:
-        # Run the HTTP server in a thread, wait for the callback
-        thread = threading.Thread(target=server.handle_request, daemon=True)
-        thread.start()
-        # Wait with timeout
-        if not _CallbackHandler.done.wait(timeout=300):
+            class _IPv6HTTPServer(HTTPServer):
+                address_family = _socket.AF_INET6
+
+            server = _IPv6HTTPServer((callback_host, port), _CallbackHandler)
+        else:
+            server = HTTPServer((callback_host, port), _CallbackHandler)
+
+        async def redirect_handler(auth_url: str) -> None:
+            print("Opening browser for authorization...", file=sys.stderr)
+            print(f"If browser doesn't open, visit: {auth_url}", file=sys.stderr)
+            webbrowser.open(auth_url)
+
+        async def callback_handler():
+            # Run the HTTP server in a thread, wait for the callback
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            # Wait with timeout
+            if not _CallbackHandler.done.wait(timeout=300):
+                server.server_close()
+                raise TimeoutError("OAuth callback timed out after 5 minutes")
             server.server_close()
-            raise TimeoutError("OAuth callback timed out after 5 minutes")
-        server.server_close()
-        if _CallbackHandler.error:
-            raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
-        if not _CallbackHandler.auth_code:
-            raise RuntimeError("No authorization code received")
-        return (_CallbackHandler.auth_code, _CallbackHandler.state)
+            if _CallbackHandler.error:
+                raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
+            if not _CallbackHandler.auth_code:
+                raise RuntimeError("No authorization code received")
+            return _authorization_code_result(
+                _CallbackHandler.auth_code, _CallbackHandler.state
+            )
 
     return _RobustOAuthClientProvider(
         server_url=server_url,
@@ -1288,8 +1590,34 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
 
 def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
     commands: list[CommandDef] = []
-    for tool in tools:
-        name = to_kebab(tool.get("name", "unknown"))
+    base_names = [to_kebab(tool.get("name", "unknown")) for tool in tools]
+    reserved_names = set(base_names)
+    cli_names = [""] * len(tools)
+    used_names: set[str] = set()
+    groups: dict[str, list[int]] = {}
+    for index, base_name in enumerate(base_names):
+        groups.setdefault(base_name, []).append(index)
+
+    # Assign aliases from the complete tool-name set so a generated suffix can
+    # never shadow another tool's natural name. Sorting each collision group by
+    # wire name keeps aliases stable when a server reorders tools/list.
+    for base_name in sorted(groups):
+        indices = sorted(
+            groups[base_name],
+            key=lambda index: (tools[index].get("name", "unknown"), index),
+        )
+        for rank, index in enumerate(indices):
+            name = base_name
+            if rank:
+                suffix = 2
+                name = f"{base_name}-{suffix}"
+                while name in reserved_names or name in used_names:
+                    suffix += 1
+                    name = f"{base_name}-{suffix}"
+            cli_names[index] = name
+            used_names.add(name)
+
+    for tool, name in zip(tools, cli_names):
         desc = tool.get("description", "")
         schema = tool.get("inputSchema", {})
         required_fields = set(schema.get("required", []))
@@ -1728,12 +2056,12 @@ def _build_graphql_document(
     types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
 
     # Build variables dict from args
-    if getattr(args, "stdin", False):
+    if getattr(args, "stdin", False) is True:
         variables = read_stdin_json("GraphQL variables")
     else:
         variables = {}
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 variables[p.original_name] = coerce_value(val, p.schema)
 
@@ -1972,6 +2300,8 @@ def _baked_to_argv(config: dict) -> list[str]:
         argv += ["--oauth-redirect-uri", config["oauth_redirect_uri"]]
     if config.get("oauth_flow") and config["oauth_flow"] != "auto":
         argv += ["--oauth-flow", config["oauth_flow"]]
+    if config.get("oauth_manual_callback"):
+        argv.append("--oauth-manual-callback")
     return argv
 
 
@@ -2029,6 +2359,7 @@ def _bake_create(argv: list[str]) -> None:
     p.add_argument("--oauth-client-name", default="mcp2cli")
     p.add_argument("--oauth-scope", default=None)
     p.add_argument("--oauth-redirect-uri", default=None, metavar="URI")
+    p.add_argument("--oauth-manual-callback", action="store_true")
     p.add_argument(
         "--oauth-flow",
         choices=["auto", "authorization_code", "client_credentials"],
@@ -2096,6 +2427,7 @@ def _bake_create(argv: list[str]) -> None:
         "oauth_scope": args.oauth_scope,
         "oauth_redirect_uri": args.oauth_redirect_uri,
         "oauth_flow": args.oauth_flow,
+        "oauth_manual_callback": args.oauth_manual_callback,
         "include": [x.strip() for x in args.include.split(",") if x.strip()],
         "exclude": [x.strip() for x in args.exclude.split(",") if x.strip()],
         "methods": [x.strip().upper() for x in args.methods.split(",") if x.strip()],
@@ -2140,7 +2472,7 @@ def _bake_show(argv: list[str]) -> None:
             else:
                 masked.append([name, val[:4] + "****" if len(val) > 4 else "****"])
         display["auth_headers"] = masked
-    print(json.dumps(display, indent=2))
+    print(json.dumps(display, indent=2, ensure_ascii=False))
 
 
 def _bake_remove(argv: list[str]) -> None:
@@ -2234,6 +2566,8 @@ def _run_baked(name: str, argv: list[str]) -> None:
         include=cfg.get("include", []),
         exclude=cfg.get("exclude", []),
         methods=cfg.get("methods", []),
+        prog=name,
+        description=cfg.get("description"),
     )
     _main_impl(synthetic_argv, bake_config=bake_config)
 
@@ -2244,11 +2578,15 @@ def _run_baked(name: str, argv: list[str]) -> None:
 
 
 def build_argparse(
-    commands: list[CommandDef], pre_parser: argparse.ArgumentParser
+    commands: list[CommandDef],
+    pre_parser: argparse.ArgumentParser,
+    *,
+    prog: str = "mcp2cli",
+    description: str = _DEFAULT_PARSER_DESCRIPTION,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mcp2cli",
-        description="Turn any MCP server or OpenAPI spec into a CLI",
+        prog=prog,
+        description=description,
         parents=[pre_parser],
     )
     subparsers = parser.add_subparsers(dest="_command")
@@ -2259,6 +2597,7 @@ def build_argparse(
             help=escape_argparse_help(cmd.description),
             description=escape_argparse_help(cmd.description),
         )
+        _allocate_param_cli_names(cmd)
         sub.set_defaults(_cmd=cmd)
 
         if cmd.has_body:
@@ -2269,12 +2608,8 @@ def build_argparse(
                 help="Read JSON body/arguments from stdin",
             )
 
-        seen_flags: set[str] = set()
         for p in cmd.params:
-            flag = f"--{p.name}"
-            if flag in seen_flags:
-                continue  # skip duplicate param names (e.g. path + body both have same name)
-            seen_flags.add(flag)
+            flag = f"--{p.cli_name or p.name}"
             kwargs: dict = {}
             if p.python_type is not None:
                 kwargs["type"] = p.python_type
@@ -2292,6 +2627,7 @@ def build_argparse(
             kwargs["help"] = escape_argparse_help(p.description)
             if p.choices:
                 kwargs["choices"] = p.choices
+            kwargs["dest"] = _param_dest(p)
             sub.add_argument(flag, **kwargs)
 
     return parser
@@ -2420,13 +2756,13 @@ def _collect_openapi_params(
 
     for p in cmd.params:
         if p.location == "path":
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 path = path.replace(f"{{{p.original_name}}}", str(val))
 
     if cmd.method == "get":
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is None:
                 continue
             if p.location == "query":
@@ -2434,12 +2770,12 @@ def _collect_openapi_params(
             elif p.location == "header":
                 extra_headers[p.original_name] = str(val)
     else:
-        if getattr(args, "stdin", False):
+        if getattr(args, "stdin", False) is True:
             body = read_stdin_json("OpenAPI request body")
         else:
             body = {}
             for p in cmd.params:
-                val = getattr(args, p.name.replace("-", "_"), None)
+                val = getattr(args, _param_dest(p), None)
                 if p.location == "header":
                     if val is not None:
                         extra_headers[p.original_name] = str(val)
@@ -2464,7 +2800,7 @@ def _collect_openapi_params(
         # Also collect query params for non-GET
         for p in cmd.params:
             if p.location == "query":
-                val = getattr(args, p.name.replace("-", "_"), None)
+                val = getattr(args, _param_dest(p), None)
                 if val is not None:
                     query_params[p.original_name] = coerce_value(val, p.schema)
 
@@ -2549,6 +2885,95 @@ def execute_openapi(
 # ---------------------------------------------------------------------------
 
 
+def _exc_leaves(exc: BaseException) -> list[BaseException]:
+    """Flatten nested exception groups into their leaf exceptions."""
+    nested = getattr(exc, "exceptions", None)
+    if not nested:
+        return [exc]
+    return [leaf for child in nested for leaf in _exc_leaves(child)]
+
+
+def _exc_message(exc: BaseException) -> str:
+    """Flatten an exception group into one terminal-safe line."""
+    parts = []
+    for leaf in _exc_leaves(exc):
+        message = str(leaf) or leaf.__class__.__name__
+        parts.append("; ".join(line.strip() for line in message.splitlines() if line.strip()))
+    return "; ".join(part for part in parts if part) or exc.__class__.__name__
+
+
+def _run_mcp_clean(fn, source: str):
+    """Run an MCP coroutine, reporting failures as one clean error line.
+
+    Transport failures (bad URL, refused connection, 401/403) otherwise reach
+    the terminal as a multi-level anyio ExceptionGroup traceback with the
+    actual cause buried at the bottom. Set MCP2CLI_DEBUG=1 for the traceback.
+    """
+    try:
+        return anyio.run(fn)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:  # pragma: no cover - interactive only
+        raise
+    except BaseException as exc:
+        leaves = _exc_leaves(exc)
+        if len(leaves) == 1 and isinstance(leaves[0], (SystemExit, KeyboardInterrupt)):
+            raise leaves[0]
+        if os.environ.get("MCP2CLI_DEBUG"):
+            raise
+        message = _exc_message(exc)
+        lowered = message.lower()
+        if "401" in lowered or "403" in lowered:
+            hint = (
+                " — the server rejected the request; pass credentials with "
+                "--auth-header 'Name:Value' or use the --oauth-* options"
+            )
+        else:
+            hint = ""
+        print(f"Error: cannot use MCP server at {source}: {message}{hint}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _normalize_root(raw: str) -> str:
+    """Return a validated file URI for one ``--root`` value."""
+    if "://" in raw:
+        if not raw.casefold().startswith("file://"):
+            raise ValueError(
+                f"--root expects a filesystem path or file:// URI, got {raw!r}"
+            )
+        uri = raw
+    else:
+        uri = Path(raw).expanduser().resolve().as_uri()
+
+    from mcp import types
+
+    try:
+        return str(types.Root(uri=uri).uri)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid --root value {raw!r}: {exc}") from exc
+
+
+def _roots_callback(root_uris: list[str] | None = None):
+    """Answer ``roots/list`` from validated file URIs, if any were given."""
+    configured_roots = tuple(_ROOTS if root_uris is None else root_uris)
+    if not configured_roots:
+        return None
+
+    from mcp import types
+
+    async def list_roots(context=None):
+        roots = [
+            types.Root(
+                uri=uri,
+                name=Path(urlparse(uri).path).name or uri,
+            )
+            for uri in configured_roots
+        ]
+        return types.ListRootsResult(roots=roots)
+
+    return list_roots
+
+
 def run_mcp_http(
     url: str,
     auth_headers: list[tuple[str, str]],
@@ -2568,6 +2993,7 @@ def run_mcp_http(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -2583,6 +3009,7 @@ def run_mcp_http(
         prompt_action=prompt_action,
         prompt_name=prompt_name,
         prompt_arguments=prompt_arguments,
+        complete_spec=complete_spec,
         search_pattern=search_pattern,
         head=head,
         verbose=verbose,
@@ -2599,12 +3026,10 @@ def run_mcp_http(
         headers = dict(auth_headers) if auth_headers else None
 
         async def _with_streamable():
-            from mcp.client.streamable_http import streamablehttp_client
-
-            async with streamablehttp_client(
+            async with _streamable_streams(
                 url, headers=headers, auth=oauth_provider
-            ) as (read, write, _):
-                async with ClientSession(read, write) as session:
+            ) as (read, write):
+                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                     await session.initialize()
                     return await _mcp_session(
                         session,
@@ -2627,7 +3052,7 @@ def run_mcp_http(
                 read,
                 write,
             ):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                     await session.initialize()
                     return await _mcp_session(
                         session,
@@ -2653,7 +3078,9 @@ def run_mcp_http(
             except Exception:
                 return await _with_sse()
 
-    anyio.run(_run)
+    rc = _run_mcp_clean(_run, url)
+    if rc:
+        sys.exit(rc)
 
 
 def run_mcp_stdio(
@@ -2673,6 +3100,7 @@ def run_mcp_stdio(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -2688,6 +3116,7 @@ def run_mcp_stdio(
         prompt_action=prompt_action,
         prompt_name=prompt_name,
         prompt_arguments=prompt_arguments,
+        complete_spec=complete_spec,
         search_pattern=search_pattern,
         head=head,
         verbose=verbose,
@@ -2709,9 +3138,9 @@ def run_mcp_stdio(
         params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
 
         async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
+            async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                 await session.initialize()
-                await _mcp_session(
+                return await _mcp_session(
                     session,
                     tool_name,
                     arguments,
@@ -2725,7 +3154,9 @@ def run_mcp_stdio(
                     **extra,
                 )
 
-    anyio.run(_run)
+    rc = _run_mcp_clean(_run, command_str)
+    if rc:
+        sys.exit(rc)
 
 
 async def _mcp_session(
@@ -2744,6 +3175,7 @@ async def _mcp_session(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     head: int | None = None,
     verbose: bool = False,
@@ -2753,6 +3185,14 @@ async def _mcp_session(
     source_hash: str = "",
     json_output: bool = False,
 ):
+    # Handle completion requests
+    if complete_spec:
+        await _handle_completion(
+            session, complete_spec, pretty, raw, toon, head=head,
+            json_output=json_output,
+        )
+        return
+
     # Handle resource operations
     if resource_action:
         await _handle_resources(
@@ -2776,14 +3216,14 @@ async def _mcp_session(
     )
 
     if list_mode:
-        result = await session.list_tools()
+        all_tools = await _list_all_tools(session)
         tools = [
             {
                 "name": t.name,
                 "description": t.description or "",
-                "inputSchema": t.inputSchema or {},
+                "inputSchema": _mcp_attr(t, "inputSchema") or {},
             }
-            for t in result.tools
+            for t in all_tools
         ]
         commands = extract_mcp_commands(tools)
         if search_pattern:
@@ -2813,12 +3253,29 @@ async def _mcp_session(
 
     if json_output:
         # Emit the full MCP CallToolResult envelope (content, structuredContent,
-        # isError) using the SDK's own serializer — 100% MCP-compatible.
-        output_result(result.model_dump(mode="json"), pretty=pretty, head=head, json_output=True)
-        return
+        # isError) with the camelCase wire names, so the envelope does not
+        # change shape with the installed SDK major.
+        output_result(_mcp_dump(result), pretty=pretty, head=head, json_output=True)
+        # A failed tool still exits non-zero under --json so callers can detect
+        # it; the envelope on stdout already carries isError for machines.
+        return 1 if _mcp_attr(result, "isError") else 0
 
     text = _extract_content_parts(result.content)
-    output_result(text, pretty=pretty, raw=raw, toon=toon, head=head)
+    payload = text
+    if not payload:
+        # A tool may return only structuredContent with an empty content list.
+        structured = _mcp_attr(result, "structuredContent")
+        if structured is not None:
+            payload = structured
+
+    if _mcp_attr(result, "isError"):
+        # Return the code instead of raising inside the anyio task group, which
+        # would wrap SystemExit in a BaseExceptionGroup traceback.
+        error = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        print(f"Error: {error or f'tool {tool_name!r} reported an error'}", file=sys.stderr)
+        return 1
+    output_result(payload, pretty=pretty, raw=raw, toon=toon, head=head)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2844,7 +3301,7 @@ async def _handle_resources(
                 "name": r.name,
                 "uri": str(r.uri),
                 "description": r.description or "",
-                "mimeType": r.mimeType or "",
+                "mimeType": _mcp_attr(r, "mimeType") or "",
             }
             for r in result.resources
         ]
@@ -2854,17 +3311,15 @@ async def _handle_resources(
         data = [
             {
                 "name": t.name,
-                "uriTemplate": str(t.uriTemplate),
+                "uriTemplate": str(_mcp_attr(t, "uriTemplate")),
                 "description": t.description or "",
-                "mimeType": t.mimeType or "",
+                "mimeType": _mcp_attr(t, "mimeType") or "",
             }
-            for t in result.resourceTemplates
+            for t in _mcp_attr(result, "resourceTemplates")
         ]
         output_result(data, **_out)
     elif action == "read":
-        from pydantic import AnyUrl
-
-        result = await session.read_resource(AnyUrl(uri))
+        result = await session.read_resource(_resource_uri(uri))
         parts = []
         for content in result.contents:
             if hasattr(content, "text"):
@@ -2878,6 +3333,67 @@ async def _handle_resources(
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
+
+
+def parse_complete_spec(spec: str) -> tuple[str, str, str]:
+    """Parse ``REF:ARG=PREFIX`` into (ref, argument, prefix).
+
+    ``REF`` is a prompt name, or a resource URI template when it contains
+    ``://`` — in which case the scheme's own colons must not be mistaken for
+    the ref/arg separator.
+    """
+    ref_part, sep, prefix = spec.partition("=")
+    if not sep:
+        print(
+            "Error: --complete expects REF:ARG=PREFIX (e.g. 'my-prompt:city=San')",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    ref, sep, argument = ref_part.rpartition(":")
+    if not sep or not ref or not argument:
+        print(
+            f"Error: --complete could not split {ref_part!r} into REF:ARG",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return ref, argument, prefix
+
+
+async def _completion_data(session, spec: str) -> dict:
+    """Run ``completion/complete`` and return its stable wire-shaped payload."""
+    from mcp import types
+
+    ref_name, argument, prefix = parse_complete_spec(spec)
+    if "://" in ref_name or "{" in ref_name:
+        ref = types.ResourceTemplateReference(
+            type="ref/resource", uri=ref_name
+        )
+    else:
+        ref = types.PromptReference(type="ref/prompt", name=ref_name)
+
+    result = await session.complete(ref, {"name": argument, "value": prefix})
+    completion = result.completion
+    return {
+        "values": list(completion.values or []),
+        "total": completion.total,
+        "hasMore": _mcp_attr(completion, "hasMore"),
+    }
+
+
+async def _handle_completion(
+    session,
+    spec: str,
+    pretty: bool,
+    raw: bool,
+    toon: bool,
+    head: int | None = None,
+    json_output: bool = False,
+):
+    """Run ``completion/complete`` for a prompt or resource-template argument."""
+    data = await _completion_data(session, spec)
+    output_result(
+        data, pretty=pretty, raw=raw, toon=toon, head=head, json_output=json_output
+    )
 
 
 async def _handle_prompts(
@@ -2919,7 +3435,7 @@ async def _handle_prompts(
                 messages.append({"role": msg.role, "content": content.text})
             else:
                 messages.append(
-                    {"role": msg.role, "content": json.dumps(content.model_dump())}
+                    {"role": msg.role, "content": json.dumps(_mcp_dump(content))}
                 )
         data = {"description": result.description or "", "messages": messages}
         output_result(data, **_out)
@@ -3002,6 +3518,7 @@ def session_start(
     auth_headers: list[tuple[str, str]],
     env_vars: dict[str, str],
     transport: str = "auto",
+    roots: list[str] | None = None,
 ):
     """Start a persistent session daemon."""
     _mkdir_private(SESSIONS_DIR)
@@ -3042,6 +3559,7 @@ def session_start(
                 "auth_headers": auth_headers,
                 "env_vars": env_vars,
                 "transport": transport,
+                "roots": list(roots or []),
             }
         ),
     )
@@ -3090,49 +3608,89 @@ def session_start(
 
 
 def _extract_content_parts(content_list, *, attrs=("text", "data")) -> str:
-    """Extract text/data/blob from MCP content objects, joined by newline."""
+    """Extract text/data/blob from MCP content objects, joined by newline.
+
+    ``resource_link`` blocks carry neither ``text`` nor ``data`` — only
+    ``uri``/``name`` — so they used to be dropped silently. Render them as
+    ``name: uri`` (or just the URI) instead.
+    """
     parts = []
-    for c in content_list:
+    for content in content_list:
+        is_mapping = isinstance(content, dict)
         for attr in attrs:
-            if hasattr(c, attr):
-                parts.append(getattr(c, attr))
+            value = content.get(attr) if is_mapping else getattr(content, attr, None)
+            if value is not None:
+                parts.append(value)
                 break
+        else:
+            uri = content.get("uri") if is_mapping else getattr(content, "uri", None)
+            if uri is not None:
+                name = content.get("name") if is_mapping else getattr(content, "name", None)
+                parts.append(f"{name}: {uri}" if name else str(uri))
     return "\n".join(parts) if parts else ""
 
 
+async def _list_all_tools(session):
+    """Fetch every tool from an MCP session, following `nextCursor` until
+    exhausted. Per the MCP spec, tools/list is paginated and page size is
+    entirely up to the server, so a single call is not guaranteed to return
+    the full tool set: https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination
+    """
+    tools = []
+    cursor = None
+    while True:
+        result = await _list_tools_page(session, cursor)
+        tools.extend(result.tools)
+        cursor = _mcp_attr(result, "nextCursor")
+        if not cursor:
+            return tools
+
+
 async def _dispatch_list_tools(session, params):
-    result = await session.list_tools()
+    tools = await _list_all_tools(session)
     return [
-        {"name": t.name, "description": t.description or "", "inputSchema": t.inputSchema or {}}
-        for t in result.tools
+        {
+            "name": t.name,
+            "description": t.description or "",
+            "inputSchema": _mcp_attr(t, "inputSchema") or {},
+        }
+        for t in tools
     ]
 
 
 async def _dispatch_call_tool(session, params):
     result = await session.call_tool(params["name"], params.get("arguments", {}))
-    return _extract_content_parts(result.content)
+    return _mcp_dump(result)
 
 
 async def _dispatch_list_resources(session, params):
     result = await session.list_resources()
     return [
-        {"name": r.name, "uri": str(r.uri), "description": r.description or "", "mimeType": r.mimeType or ""}
+        {
+            "name": r.name,
+            "uri": str(r.uri),
+            "description": r.description or "",
+            "mimeType": _mcp_attr(r, "mimeType") or "",
+        }
         for r in result.resources
     ]
 
 
 async def _dispatch_read_resource(session, params):
-    from pydantic import AnyUrl
-
-    result = await session.read_resource(AnyUrl(params["uri"]))
+    result = await session.read_resource(_resource_uri(params["uri"]))
     return _extract_content_parts(result.contents, attrs=("text", "blob"))
 
 
 async def _dispatch_list_resource_templates(session, params):
     result = await session.list_resource_templates()
     return [
-        {"name": t.name, "uriTemplate": str(t.uriTemplate), "description": t.description or "", "mimeType": t.mimeType or ""}
-        for t in result.resourceTemplates
+        {
+            "name": t.name,
+            "uriTemplate": str(_mcp_attr(t, "uriTemplate")),
+            "description": t.description or "",
+            "mimeType": _mcp_attr(t, "mimeType") or "",
+        }
+        for t in _mcp_attr(result, "resourceTemplates")
     ]
 
 
@@ -3159,8 +3717,14 @@ async def _dispatch_get_prompt(session, params):
         if hasattr(content, "text"):
             messages.append({"role": msg.role, "content": content.text})
         else:
-            messages.append({"role": msg.role, "content": json.dumps(content.model_dump())})
+            messages.append(
+                {"role": msg.role, "content": json.dumps(_mcp_dump(content))}
+            )
     return {"description": result.description or "", "messages": messages}
+
+
+async def _dispatch_complete(session, params):
+    return await _completion_data(session, params["spec"])
 
 
 _SESSION_DISPATCH = {
@@ -3171,6 +3735,7 @@ _SESSION_DISPATCH = {
     "list_resource_templates": _dispatch_list_resource_templates,
     "list_prompts": _dispatch_list_prompts,
     "get_prompt": _dispatch_get_prompt,
+    "complete": _dispatch_complete,
 }
 
 
@@ -3196,6 +3761,7 @@ def _run_session_daemon(config_path: str):
     auth_headers = [tuple(h) for h in config["auth_headers"]]
     env_vars = config["env_vars"]
     transport = config["transport"]
+    roots = config.get("roots", [])
 
     sock_path = _session_sock_path(name)
     meta_path = _session_meta_path(name)
@@ -3321,27 +3887,24 @@ def _run_session_daemon(config_path: str):
             env = {**os.environ, **env_vars}
             params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
             async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback(roots)) as session:
                     await _run_with_session(session)
         else:
             headers = dict(auth_headers) if auth_headers else None
 
             async def _via_streamable():
-                from mcp.client.streamable_http import streamablehttp_client
-
-                async with streamablehttp_client(source, headers=headers) as (
+                async with _streamable_streams(source, headers=headers) as (
                     read,
                     write,
-                    _,
                 ):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback(roots)) as session:
                         await _run_with_session(session)
 
             async def _via_sse():
                 from mcp.client.sse import sse_client
 
                 async with sse_client(source, headers=headers) as (read, write):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback(roots)) as session:
                         await _run_with_session(session)
 
             if transport == "sse":
@@ -3469,6 +4032,7 @@ def handle_mcp(
     prompt_action: str | None = None,
     prompt_name: str | None = None,
     prompt_arguments: dict | None = None,
+    complete_spec: str | None = None,
     search_pattern: str | None = None,
     bake_config: BakeConfig | None = None,
     head: int | None = None,
@@ -3490,14 +4054,15 @@ def handle_mcp(
     key = cache_key_override or cache_key_for(config_for_cache)
     src_hash = _source_hash_for(source)
 
-    # Resource/prompt operations skip the tool flow entirely
-    if resource_action or prompt_action:
+    # Resource/prompt/completion operations skip the tool flow entirely
+    if resource_action or prompt_action or complete_spec:
         extra = dict(
             resource_action=resource_action,
             resource_uri=resource_uri,
             prompt_action=prompt_action,
             prompt_name=prompt_name,
             prompt_arguments=prompt_arguments,
+            complete_spec=complete_spec,
             head=head,
             json_output=json_output,
         )
@@ -3563,7 +4128,8 @@ def handle_mcp(
         return
 
     pre = argparse.ArgumentParser(add_help=False)
-    parser = build_argparse(commands, pre)
+    prog, description = _parser_branding(bake_config)
+    parser = build_argparse(commands, pre, prog=prog, description=description)
     args = parser.parse_args(remaining)
 
     if not hasattr(args, "_cmd"):
@@ -3572,12 +4138,12 @@ def handle_mcp(
 
     cmd: CommandDef = args._cmd
 
-    if getattr(args, "stdin", False):
+    if getattr(args, "stdin", False) is True:
         arguments = read_stdin_json("MCP tool arguments")
     else:
         arguments = {}
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 arguments[p.original_name] = coerce_value(val, p.schema)
 
@@ -3603,14 +4169,14 @@ def _fetch_mcp_tools(
     tools_result: list[dict] = []
 
     async def _extract_tools(session):
-        result = await session.list_tools()
+        all_tools = await _list_all_tools(session)
         tools_result.extend(
             {
                 "name": t.name,
                 "description": t.description or "",
-                "inputSchema": t.inputSchema or {},
+                "inputSchema": _mcp_attr(t, "inputSchema") or {},
             }
-            for t in result.tools
+            for t in all_tools
         )
 
     async def _run():
@@ -3624,7 +4190,7 @@ def _fetch_mcp_tools(
             env = {**os.environ, **env_vars}
             params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
             async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
+                async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                     await session.initialize()
                     await _extract_tools(session)
         else:
@@ -3633,12 +4199,10 @@ def _fetch_mcp_tools(
             headers = dict(auth_headers) if auth_headers else None
 
             async def _via_streamable():
-                from mcp.client.streamable_http import streamablehttp_client
-
-                async with streamablehttp_client(
+                async with _streamable_streams(
                     source, headers=headers, auth=oauth_provider
-                ) as (read, write, _):
-                    async with ClientSession(read, write) as session:
+                ) as (read, write):
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                         await session.initialize()
                         await _extract_tools(session)
 
@@ -3649,7 +4213,7 @@ def _fetch_mcp_tools(
                     read,
                     write,
                 ):
-                    async with ClientSession(read, write) as session:
+                    async with ClientSession(read, write, list_roots_callback=_roots_callback()) as session:
                         await session.initialize()
                         await _extract_tools(session)
 
@@ -3663,7 +4227,7 @@ def _fetch_mcp_tools(
                 except Exception:
                     await _via_sse()
 
-    anyio.run(_run)
+    _run_mcp_clean(_run, source)
     return tools_result
 
 
@@ -3716,6 +4280,7 @@ def _split_at_subcommand(
 
 
 def main():
+    _ensure_utf8_output()
     if len(sys.argv) > 1:
         first = sys.argv[1]
         if first == "bake":
@@ -3849,6 +4414,26 @@ def _build_main_parser() -> argparse.ArgumentParser:
         help="Environment variable KEY=VALUE for MCP stdio (repeatable)",
     )
     pre.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        metavar="PATH|FILE_URI",
+        help=(
+            "Expose a filesystem path or file:// URI to the server (repeatable). "
+            "Workspace-scoped servers request these via roots/list."
+        ),
+    )
+    pre.add_argument(
+        "--complete",
+        default=None,
+        metavar="REF:ARG=PREFIX",
+        help=(
+            "Ask the server to complete an argument value, e.g. "
+            "--complete 'my-prompt:city=San'. REF is a prompt name, or a "
+            "resource URI template when it contains '://'."
+        ),
+    )
+    pre.add_argument(
         "--oauth",
         action="store_true",
         help="Enable OAuth authentication (authorization code + PKCE flow)",
@@ -3892,6 +4477,13 @@ def _build_main_parser() -> argparse.ArgumentParser:
             "Use 'authorization_code' to force the auth code + PKCE flow even with a "
             "client secret (required for confidential-client servers like Slack)."
         ),
+    )
+    pre.add_argument(
+        "--oauth-manual-callback",
+        action="store_true",
+        help="Don't run a local callback server; print the authorization URL and read "
+             "the redirect URL back from stdin. For hosts with no reachable browser, "
+             "e.g. a VPS over SSH.",
     )
     # Resource flags
     pre.add_argument(
@@ -4022,6 +4614,7 @@ def _setup_oauth(pre_args):
         scope=pre_args.oauth_scope,
         redirect_uri=pre_args.oauth_redirect_uri,
         flow=flow,
+        manual_callback=getattr(pre_args, "oauth_manual_callback", False),
     )
 
 
@@ -4068,6 +4661,7 @@ def _handle_session_operations(
             auth_headers,
             env_vars,
             transport=pre_args.transport,
+            roots=_ROOTS,
         )
         return True
 
@@ -4080,6 +4674,13 @@ def _handle_session_operations(
         pretty=pre_args.pretty, raw=pre_args.raw, toon=pre_args.toon,
         json_output=pre_args.json_output,
     )
+    if pre_args.complete:
+        result = _session_request(
+            sess_name, "complete", {"spec": pre_args.complete}
+        )
+        output_result(result, head=pre_args.head, **_sess_out)
+        return True
+
 
     if pre_args.list_resources:
         result = _session_request(sess_name, "list_resources")
@@ -4161,18 +4762,41 @@ def _handle_session_operations(
         sys.exit(1)
 
     cmd: CommandDef = args._cmd
-    if getattr(args, "stdin", False):
+    if getattr(args, "stdin", False) is True:
         arguments = read_stdin_json(f"session {sess_name} tool arguments")
     else:
         arguments = {}
         for p in cmd.params:
-            val = getattr(args, p.name.replace("-", "_"), None)
+            val = getattr(args, _param_dest(p), None)
             if val is not None:
                 arguments[p.original_name] = coerce_value(val, p.schema)
 
     result = _session_request(
         sess_name, "call_tool", {"name": cmd.tool_name, "arguments": arguments}
     )
+    if isinstance(result, dict) and "isError" in result:
+        content = result.get("content") or []
+        text = _extract_content_parts(content) if isinstance(content, list) else content
+        payload = text or result.get("structuredContent") or ""
+
+        if pre_args.json_output:
+            output_result(result, **_sess_out)
+            if result.get("isError"):
+                sys.exit(1)
+            return True
+
+        if result.get("isError"):
+            error = (
+                payload
+                if isinstance(payload, str)
+                else json.dumps(payload, ensure_ascii=False)
+            )
+            print(
+                f"Error: {error or f'tool {cmd.tool_name!r} reported an error'}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        result = payload
     output_result(result, **_sess_out)
     return True
 
@@ -4283,7 +4907,8 @@ def _handle_openapi_mode(
                 )
                 sys.exit(1)
 
-    parser = build_argparse(commands, pre)
+    prog, description = _parser_branding(bake_config)
+    parser = build_argparse(commands, pre, prog=prog, description=description)
     args = parser.parse_args(remaining)
 
     if not hasattr(args, "_cmd"):
@@ -4310,6 +4935,12 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
     global_argv, tool_argv = _split_at_subcommand(argv, pre)
     pre_args, leftover = pre.parse_known_args(global_argv)
     remaining = leftover + tool_argv
+
+    try:
+        _ROOTS[:] = [_normalize_root(raw) for raw in pre_args.root]
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     # --search implies --list
     search_pattern = pre_args.search_pattern
@@ -4382,6 +5013,7 @@ def _main_impl(argv: list[str], bake_config: BakeConfig | None = None):
             prompt_action=prompt_action,
             prompt_name=prompt_name,
             prompt_arguments=prompt_arguments,
+            complete_spec=pre_args.complete,
             search_pattern=search_pattern,
             bake_config=bake_config,
             head=pre_args.head,

@@ -1,6 +1,6 @@
 [project]
 name = "mcp2cli"
-version = "3.3.1"
+version = "3.7.0"
 description = "Turn any MCP server or OpenAPI spec into a CLI"
 readme = "README.md"
 license = "MIT"
@@ -10,7 +10,9 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "httpx",
-    "mcp>=1.0",
+    # Works on both SDK majors; 1.26 is the floor we verify in CI, and the one
+    # where `streamable_http_client` + `create_mcp_http_client` are both present.
+    "mcp>=1.26,<3",
     "pyyaml",
 ]
 

@@ -1,158 +1,106 @@
+"""Minimal MCP server for testing — Streamable HTTP over stdlib http.server.
 
-"""Minimal MCP HTTP server for testing."""
-import asyncio
-import base64
+Speaks the JSON-RPC wire protocol directly (see `_mcp_fixture`), so it works
+against any `mcp` SDK major and needs no starlette/uvicorn.
+
+This is deliberately **POST-only**: `GET` on the endpoint returns 405, which is
+what a server that does not offer a server-to-client stream is supposed to do,
+and matches the real-world gateways reported in #68/#74. Exercising that shape
+here keeps us honest about whether the client actually needs the GET handshake.
+
+Prints `PORT=<n>` on stdout once bound, so the test fixture can find it.
+"""
+
+import json
 import socket
 import sys
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from mcp.server import Server
-from mcp.server.lowlevel.helper_types import ReadResourceContents
-from mcp.types import (
-    GetPromptResult,
-    Prompt,
-    PromptArgument,
-    PromptMessage,
-    Resource,
-    ResourceTemplate,
-    TextContent,
-    Tool,
-)
+from _mcp_fixture import handle
 
-app = Server("test-http-server")
+ENDPOINT = "/mcp"
 
 
-@app.list_tools()
-async def list_tools():
-    return [
-        Tool(
-            name="echo",
-            description="Echo back the input",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Message to echo"},
-                },
-                "required": ["message"],
-            },
-        ),
-        Tool(
-            name="add_numbers",
-            description="Add two numbers",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "a": {"type": "integer", "description": "First number"},
-                    "b": {"type": "integer", "description": "Second number"},
-                },
-                "required": ["a", "b"],
-            },
-        ),
-    ]
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    session_id = None
 
+    def _send(self, status: int, body: bytes = b"", content_type: str | None = None, extra=()):
+        self.send_response(status)
+        if content_type:
+            self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in extra:
+            self.send_header(key, value)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    if name == "echo":
-        return [TextContent(type="text", text=arguments.get("message", ""))]
-    if name == "add_numbers":
-        result = arguments.get("a", 0) + arguments.get("b", 0)
-        return [TextContent(type="text", text=str(result))]
-    return [TextContent(type="text", text=f"Unknown tool: {name}")]
+    def do_POST(self):
+        if self.path.split("?")[0] != ENDPOINT:
+            self._send(404)
+            return
 
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            message = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            self._send(400)
+            return
 
-@app.list_resources()
-async def list_resources():
-    return [
-        Resource(
-            uri="file:///test/doc.txt",
-            name="Test Document",
-            description="A test text document",
-            mimeType="text/plain",
-        ),
-    ]
+        # A batch is a JSON array; a single message is an object.
+        batch = message if isinstance(message, list) else [message]
+        responses = [r for r in (handle(m) for m in batch) if r is not None]
 
+        extra = []
+        if any(m.get("method") == "initialize" for m in batch):
+            Handler.session_id = uuid.uuid4().hex
+        if Handler.session_id:
+            extra.append(("Mcp-Session-Id", Handler.session_id))
 
-@app.list_resource_templates()
-async def list_resource_templates():
-    return [
-        ResourceTemplate(
-            uriTemplate="file:///test/{name}.txt",
-            name="Text File",
-            description="A text file by name",
-            mimeType="text/plain",
-        ),
-    ]
+        if not responses:
+            # Notifications only -- nothing to answer.
+            self._send(202, extra=extra)
+            return
 
-
-@app.read_resource()
-async def read_resource(uri):
-    uri_str = str(uri)
-    if uri_str == "file:///test/doc.txt":
-        return [ReadResourceContents(content="Hello from test document!", mime_type="text/plain")]
-    raise ValueError(f"Resource not found: {uri_str}")
-
-
-@app.list_prompts()
-async def list_prompts():
-    return [
-        Prompt(
-            name="greeting",
-            description="Generate a greeting message",
-            arguments=[
-                PromptArgument(name="name", description="Name to greet", required=True),
-                PromptArgument(name="style", description="Greeting style", required=False),
-            ],
-        ),
-    ]
-
-
-@app.get_prompt()
-async def get_prompt(name: str, arguments: dict | None = None):
-    arguments = arguments or {}
-    if name == "greeting":
-        who = arguments.get("name", "World")
-        style = arguments.get("style", "friendly")
-        return GetPromptResult(
-            description=f"A {style} greeting",
-            messages=[
-                PromptMessage(role="user", content=TextContent(type="text", text=f"Please greet {who} in a {style} way.")),
-            ],
+        payload = responses[0] if not isinstance(message, list) else responses
+        self._send(
+            200,
+            json.dumps(payload).encode(),
+            "application/json",
+            extra,
         )
-    raise ValueError(f"Unknown prompt: {name}")
+
+    def do_GET(self):
+        # POST-only server: no server-to-client stream on offer.
+        self._send(405, b"", None, [("Allow", "POST, DELETE")])
+
+    def do_DELETE(self):
+        Handler.session_id = None
+        self._send(200)
+
+    def log_message(self, fmt, *args):
+        pass  # keep test output clean
 
 
-def find_free_port():
+def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-async def main():
-    from mcp.server.sse import SseServerTransport
-    from starlette.applications import Starlette
-    from starlette.routing import Mount, Route
-    import uvicorn
-
-    sse = SseServerTransport("/messages/")
-
-    async def handle_sse(request):
-        async with sse.connect_sse(request.scope, request.receive, request._send) as (read, write):
-            await app.run(read, write, app.create_initialization_options())
-
-    starlette_app = Starlette(
-        routes=[
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ],
-    )
-
+def main() -> None:
     port = find_free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"PORT={port}", flush=True)
-
-    config = uvicorn.Config(starlette_app, host="127.0.0.1", port=port, log_level="error")
-    server = uvicorn.Server(config)
-    await server.serve()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
