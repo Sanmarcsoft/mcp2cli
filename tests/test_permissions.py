@@ -261,3 +261,175 @@ class TestResolveSecretWarning:
         f.write_text("value")
         assert mcp2cli.resolve_secret(f"file:{f}") == "value"
         assert "visible in process listings" not in capsys.readouterr().err
+
+
+def _isolate_paths(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    oauth = tmp_path / "oauth"
+    config = tmp_path / "config"
+    sessions = tmp_path / "sessions"
+    monkeypatch.setattr(mcp2cli, "CACHE_DIR", cache)
+    monkeypatch.setattr(mcp2cli, "OAUTH_DIR", oauth)
+    monkeypatch.setattr(mcp2cli, "CONFIG_DIR", config)
+    monkeypatch.setattr(mcp2cli, "BAKED_FILE", config / "baked.json")
+    monkeypatch.setattr(mcp2cli, "SESSIONS_DIR", sessions)
+    monkeypatch.setattr(mcp2cli, "USAGE_FILE", cache / "usage.json")
+
+
+class TestSecurityGateHardening:
+    def test_oauth_preseed_client_json_is_0600(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        _isolate_paths(tmp_path, monkeypatch)
+        mcp2cli.build_oauth_provider(
+            "https://example.com/mcp",
+            client_id="cid",
+            client_secret="S3CRET",
+            flow="authorization_code",
+        )
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp")
+        assert storage._client_path.exists()
+        assert _mode(storage._client_path) == 0o600
+        content = storage._client_path.read_text()
+        assert "S3CRET" in content
+
+    def test_no_credential_file_or_dir_is_group_or_world_accessible(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        _isolate_paths(tmp_path, monkeypatch)
+
+        # 1. save_cache
+        mcp2cli.save_cache("cache_entry", {"schemas": ["secret-schema"]})
+
+        # 2. _save_usage
+        mcp2cli._save_usage({"src_hash": {"my_tool": {"count": 1}}})
+
+        # 3. FileTokenStorage set_tokens and set_client_info
+        storage = mcp2cli.FileTokenStorage("https://example.com/mcp-storage")
+        from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+
+        async def _exercise_storage():
+            token = OAuthToken(
+                access_token="secret-access-token",
+                token_type="Bearer",
+                refresh_token="secret-refresh-token",
+                expires_in=3600,
+            )
+            await storage.set_tokens(token)
+            info = OAuthClientInformationFull(
+                client_id="storage-client-id",
+                client_secret="storage-client-secret",
+                redirect_uris=["http://127.0.0.1:9999/callback"],
+            )
+            await storage.set_client_info(info)
+
+        anyio.run(_exercise_storage)
+
+        # 4. OAuth pre-seed
+        mcp2cli.build_oauth_provider(
+            "https://example.com/mcp-preseed",
+            client_id="preseed-id",
+            client_secret="preseed-secret",
+            flow="authorization_code",
+        )
+
+        # 5. _save_baked_all
+        mcp2cli._save_baked_all(
+            {
+                "baked_srv": {
+                    "source": "https://example.com",
+                    "auth_headers": [("Authorization", "Bearer tok")],
+                }
+            }
+        )
+
+        # 6. session_start (using the same fakes as test c)
+        class FakeProc:
+            pid = 5678
+            returncode = 0
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                pass
+
+        def fake_popen(argv, **kwargs):
+            err = kwargs.get("stderr")
+            if hasattr(err, "close"):
+                err.close()
+            sock = mcp2cli._session_sock_path("sess_walk")
+            mcp2cli._write_private(sock, "")
+            return FakeProc()
+
+        monkeypatch.setattr(mcp2cli.subprocess, "Popen", fake_popen)
+        mcp2cli.session_start(
+            "sess_walk",
+            "https://example.com/mcp",
+            False,
+            [("Authorization", "Bearer token-123")],
+            {"API_KEY": "key-123"},
+            roots=["file:///tmp/project-walk"],
+        )
+
+        # Directory-walk sweep: assert every file and dir has no group/other bits
+        found_paths = list(tmp_path.rglob("*"))
+        assert len(found_paths) > 0, "Expected files and directories to be created under tmp_path"
+        for p in found_paths:
+            mode = _mode(p)
+            assert (
+                mode & 0o077 == 0
+            ), f"Path {p} has unsafe permissions: {oct(mode)} (group/other accessible)"
+
+    def test_session_start_passes_roots_via_private_config_not_argv(
+        self, tmp_path, monkeypatch, permissive_umask
+    ):
+        _isolate_paths(tmp_path, monkeypatch)
+
+        auth_secret = "secret-auth-header-val"
+        env_secret = "secret-env-var-val"
+        captured = {}
+
+        class FakeProc:
+            pid = 9999
+            returncode = 0
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                pass
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = list(argv)
+            err = kwargs.get("stderr")
+            if hasattr(err, "close"):
+                err.close()
+            sock = mcp2cli._session_sock_path("sess_test")
+            mcp2cli._write_private(sock, "")
+            return FakeProc()
+
+        monkeypatch.setattr(mcp2cli.subprocess, "Popen", fake_popen)
+
+        mcp2cli.session_start(
+            "sess_test",
+            "https://example.com/mcp",
+            False,
+            [("Authorization", f"Bearer {auth_secret}")],
+            {"API_KEY": env_secret},
+            roots=["file:///tmp/project-a"],
+        )
+
+        joined_argv = " ".join(captured["argv"])
+        assert auth_secret not in joined_argv
+        assert env_secret not in joined_argv
+
+        config_path = mcp2cli.SESSIONS_DIR / "sess_test.config.json"
+        assert config_path.exists()
+        assert _mode(config_path) == 0o600
+        config_data = json.loads(config_path.read_text())
+        assert config_data["roots"] == ["file:///tmp/project-a"]
+
+        log_path = mcp2cli._session_log_path("sess_test")
+        assert log_path.exists()
+        assert _mode(log_path) == 0o600

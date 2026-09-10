@@ -1,5 +1,6 @@
 """Tests for OAuth support."""
 
+import io
 import json
 import os
 import subprocess
@@ -8,6 +9,24 @@ import sys
 import pytest
 
 import mcp2cli
+
+
+def _sdk_httpx():
+    """The httpx flavour the installed SDK is built on (v2 uses httpx2)."""
+    from mcp.shared import _httpx_utils
+
+    return getattr(_httpx_utils, "httpx2", None) or _httpx_utils.httpx
+
+
+def _code_state(result):
+    """Normalize a callback_handler result across SDK majors.
+
+    v1 returns a plain ``(code, state)`` tuple; v2 returns an
+    ``AuthorizationCodeResult`` model.
+    """
+    if isinstance(result, tuple):
+        return result
+    return (result.code, result.state)
 
 
 class TestResolveSecret:
@@ -282,6 +301,8 @@ class TestRobustOAuthClientProvider:
 
         # Build a synthetic failed refresh response
         class _FakeResponse:
+            # httpx.Response always has next_request; mcp>=1.30 reads it on refresh.
+            next_request = None
             status_code = 400
             async def aread(self):
                 return b'{"error":"invalid_grant"}'
@@ -337,6 +358,8 @@ class TestRobustOAuthClientProvider:
 
         # A 503 from the token endpoint — transient, recoverable on retry.
         class _FakeResponse:
+            # httpx.Response always has next_request; mcp>=1.30 reads it on refresh.
+            next_request = None
             status_code = 503
             async def aread(self):
                 return b"<html>Service Unavailable</html>"
@@ -379,6 +402,8 @@ class TestRobustOAuthClientProvider:
         )
 
         class _FakeResponse:
+            # httpx.Response always has next_request; mcp>=1.30 reads it on refresh.
+            next_request = None
             status_code = 401
             async def aread(self):
                 return b""
@@ -423,6 +448,8 @@ class TestRobustOAuthClientProvider:
 
         # Refresh response that rotates the access token but omits refresh_token
         class _FakeResponse:
+            # httpx.Response always has next_request; mcp>=1.30 reads it on refresh.
+            next_request = None
             status_code = 200
             async def aread(self):
                 return b'{"access_token":"new-access","token_type":"Bearer","expires_in":3600}'
@@ -467,6 +494,8 @@ class TestRobustOAuthClientProvider:
         )
 
         class _FakeResponse:
+            # httpx.Response always has next_request; mcp>=1.30 reads it on refresh.
+            next_request = None
             status_code = 200
             async def aread(self):
                 return (
@@ -751,6 +780,7 @@ class TestOAuthCLIValidation:
         assert "--oauth-scope" in r.stdout
         assert "--oauth-redirect-uri" in r.stdout
         assert "--oauth-flow" in r.stdout
+        assert "--oauth-manual-callback" in r.stdout
 
     def test_env_secret_in_client_id(self):
         """--oauth-client-id env:VAR should resolve from environment."""
@@ -980,3 +1010,283 @@ class TestCachedRedirectUriReuse:
         redirect_uris = [str(u) for u in provider.context.client_metadata.redirect_uris]
         assert "http://localhost:19890/callback" in redirect_uris
         assert "http://127.0.0.1:54321/callback" not in redirect_uris
+
+
+class TestParseOAuthCallbackInput:
+    """Tests for parsing a pasted OAuth callback URL (issue #71)."""
+
+    def test_full_url(self):
+        code, state = mcp2cli._parse_oauth_callback_input(
+            "http://127.0.0.1:5311/callback?code=abc123&state=xyz789"
+        )
+        assert (code, state) == ("abc123", "xyz789")
+
+    def test_query_string_only(self):
+        """A user who copied only the query part still gets through."""
+        assert mcp2cli._parse_oauth_callback_input("code=abc&state=xyz") == (
+            "abc",
+            "xyz",
+        )
+
+    def test_strips_surrounding_whitespace_and_quotes(self):
+        code, state = mcp2cli._parse_oauth_callback_input(
+            '  "http://127.0.0.1:1/callback?code=a&state=b"\n'
+        )
+        assert (code, state) == ("a", "b")
+
+    def test_percent_encoded_code_is_decoded(self):
+        code, _ = mcp2cli._parse_oauth_callback_input(
+            "http://127.0.0.1:1/callback?code=a%2Fb%3Dc&state=s"
+        )
+        assert code == "a/b=c"
+
+    def test_error_redirect_raises_with_description(self):
+        with pytest.raises(RuntimeError, match=r"access_denied \(user said no\)"):
+            mcp2cli._parse_oauth_callback_input(
+                "http://127.0.0.1:1/callback?error=access_denied"
+                "&error_description=user+said+no"
+            )
+
+    def test_missing_code_rejected(self):
+        with pytest.raises(ValueError, match="no 'code' parameter"):
+            mcp2cli._parse_oauth_callback_input("http://127.0.0.1:1/callback?state=xyz")
+
+    def test_missing_state_rejected(self):
+        """The SDK compares state with compare_digest and treats None as a
+        mismatch, so demand it here instead of emitting its opaque error."""
+        with pytest.raises(ValueError, match="no 'state' parameter"):
+            mcp2cli._parse_oauth_callback_input("http://127.0.0.1:1/callback?code=abc")
+
+    def test_empty_input_rejected(self):
+        with pytest.raises(ValueError, match="No callback URL"):
+            mcp2cli._parse_oauth_callback_input("   \n")
+
+
+class TestPromptOAuthCallback:
+    """Tests for reading the callback URL from stdin (issue #71)."""
+
+    def test_reads_url_from_stdin(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            sys, "stdin", io.StringIO("http://127.0.0.1:1/callback?code=c1&state=s1\n")
+        )
+        assert mcp2cli._prompt_oauth_callback() == ("c1", "s1")
+        assert "Paste the full callback URL" in capsys.readouterr().err
+
+    def test_reprompts_after_malformed_paste(self, monkeypatch, capsys):
+        """A typo must not burn the still-valid authorization code."""
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO("not-a-url\nhttp://127.0.0.1:1/callback?code=c2&state=s2\n"),
+        )
+        assert mcp2cli._prompt_oauth_callback() == ("c2", "s2")
+        assert "attempt(s) left" in capsys.readouterr().err
+
+    def test_gives_up_after_exhausting_attempts(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", io.StringIO("junk\njunk\njunk\nignored\n"))
+        with pytest.raises(ValueError):
+            mcp2cli._prompt_oauth_callback(attempts=3)
+
+    def test_eof_raises_runtime_error(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        with pytest.raises(RuntimeError, match="stdin closed"):
+            mcp2cli._prompt_oauth_callback()
+
+    def test_server_side_error_is_not_reprompted(self, monkeypatch):
+        """An error= redirect is terminal: re-asking the user cannot help."""
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO("http://127.0.0.1:1/callback?error=access_denied\n"),
+        )
+        with pytest.raises(RuntimeError, match="access_denied"):
+            mcp2cli._prompt_oauth_callback()
+
+
+class TestManualCallbackProvider:
+    """--oauth-manual-callback binds no local listener (issue #71)."""
+
+    def test_manual_callback_binds_no_local_server(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+
+        def _explode(*args, **kwargs):
+            raise AssertionError("manual callback must not bind a local HTTP server")
+
+        monkeypatch.setattr(mcp2cli, "HTTPServer", _explode)
+        from mcp.client.auth.oauth2 import OAuthClientProvider
+
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp", manual_callback=True
+        )
+        assert isinstance(provider, OAuthClientProvider)
+
+    def test_default_flow_still_binds_a_server(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        original = mcp2cli.HTTPServer
+        servers = []
+
+        def _spy(addr, handler):
+            server = original(addr, handler)
+            servers.append(server)
+            return server
+
+        monkeypatch.setattr(mcp2cli, "HTTPServer", _spy)
+        try:
+            mcp2cli.build_oauth_provider("https://example.com/mcp")
+            assert len(servers) == 1
+        finally:
+            for server in servers:
+                server.server_close()
+
+    def test_manual_callback_handler_reads_stdin(self, tmp_path, monkeypatch):
+        import anyio
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp", manual_callback=True
+        )
+        monkeypatch.setattr(
+            sys, "stdin", io.StringIO("http://127.0.0.1:1/callback?code=zz&state=yy\n")
+        )
+        assert _code_state(anyio.run(provider.context.callback_handler)) == ("zz", "yy")
+
+    def test_manual_redirect_handler_prints_url_and_skips_browser(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import anyio
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        opened = []
+        monkeypatch.setattr(mcp2cli.webbrowser, "open", opened.append)
+        provider = mcp2cli.build_oauth_provider(
+            "https://example.com/mcp", manual_callback=True
+        )
+        auth_url = "https://auth.example.com/authorize?client_id=x"
+        anyio.run(provider.context.redirect_handler, auth_url)
+        err = capsys.readouterr().err
+        assert auth_url in err
+        assert opened == [], "must not try to open a browser on a headless host"
+
+    def test_baked_config_round_trips_flag(self):
+        argv = mcp2cli._baked_to_argv(
+            {
+                "source_type": "mcp",
+                "source": "https://example.com/mcp",
+                "oauth": True,
+                "oauth_manual_callback": True,
+            }
+        )
+        assert "--oauth-manual-callback" in argv
+
+    def test_baked_config_omits_flag_when_unset(self):
+        argv = mcp2cli._baked_to_argv(
+            {
+                "source_type": "mcp",
+                "source": "https://example.com/mcp",
+                "oauth": True,
+            }
+        )
+        assert "--oauth-manual-callback" not in argv
+
+
+class TestManualCallbackEndToEnd:
+    """The pasted URL must actually complete the PKCE exchange (issue #71)."""
+
+    def test_pasted_callback_completes_token_exchange(self, tmp_path, monkeypatch):
+        import anyio
+
+        httpx = _sdk_httpx()
+
+        monkeypatch.setattr(mcp2cli, "OAUTH_DIR", tmp_path / "oauth")
+        provider = mcp2cli.build_oauth_provider(
+            "https://as.example.com/mcp", manual_callback=True
+        )
+
+        # Stand in for the browser on the user's laptop: take the URL mcp2cli
+        # printed, then type back exactly what that browser's address bar
+        # would show. State comes from the real auth URL, so the SDK's
+        # compare_digest check is genuinely exercised.
+        original_redirect = provider.context.redirect_handler
+
+        async def redirect_handler(url):
+            await original_redirect(url)
+            state = httpx.URL(url).params["state"]
+            monkeypatch.setattr(
+                sys,
+                "stdin",
+                io.StringIO(f"http://127.0.0.1:9/callback?code=THE-CODE&state={state}\n"),
+            )
+
+        provider.context.redirect_handler = redirect_handler
+
+        token_forms = []
+
+        def respond(request):
+            path = request.url.path
+            if path == "/mcp" and "authorization" not in request.headers:
+                return httpx.Response(
+                    401,
+                    headers={
+                        "WWW-Authenticate": "Bearer resource_metadata="
+                        '"https://as.example.com/.well-known/oauth-protected-resource"'
+                    },
+                    request=request,
+                )
+            if path == "/.well-known/oauth-protected-resource":
+                payload = {
+                    "resource": "https://as.example.com/mcp",
+                    "authorization_servers": ["https://as.example.com"],
+                }
+            elif "oauth-authorization-server" in path or path.endswith(
+                "openid-configuration"
+            ):
+                payload = {
+                    "issuer": "https://as.example.com",
+                    "authorization_endpoint": "https://as.example.com/authorize",
+                    "token_endpoint": "https://as.example.com/token",
+                    "registration_endpoint": "https://as.example.com/register",
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "code_challenge_methods_supported": ["S256"],
+                }
+            elif path == "/register":
+                body = json.loads(request.content)
+                return httpx.Response(
+                    201,
+                    json={
+                        "client_id": "dcr-client",
+                        "redirect_uris": body["redirect_uris"],
+                        "grant_types": body.get(
+                            "grant_types", ["authorization_code", "refresh_token"]
+                        ),
+                    },
+                    request=request,
+                )
+            elif path == "/token":
+                form = httpx.QueryParams(request.content.decode())
+                token_forms.append(form)
+                payload = {
+                    "access_token": "TOKEN-OK",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                }
+            else:
+                payload = {"ok": True}
+            return httpx.Response(200, json=payload, request=request)
+
+        async def drive():
+            request = httpx.Request("GET", "https://as.example.com/mcp")
+            flow = provider.async_auth_flow(request)
+            outbound = await flow.__anext__()
+            while True:
+                try:
+                    outbound = await flow.asend(respond(outbound))
+                except StopAsyncIteration:
+                    return outbound
+
+        final = anyio.run(drive)
+
+        assert len(token_forms) == 1, "expected exactly one token exchange"
+        assert token_forms[0].get("code") == "THE-CODE"
+        assert token_forms[0].get("code_verifier"), "PKCE verifier must be sent"
+        assert final.headers.get("authorization") == "Bearer TOKEN-OK"

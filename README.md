@@ -83,6 +83,22 @@ mcp2cli --spec ./openapi.json --base-url https://api.example.com --oauth --list
 Tokens are persisted in `~/.cache/mcp2cli/oauth/` so subsequent calls reuse existing tokens
 and refresh automatically when they expire.
 
+#### Headless hosts — no browser on the machine running mcp2cli
+
+The default authorization-code flow starts a callback server on `127.0.0.1`, which only
+works when the browser runs on the same machine. On a VPS over SSH or in a container,
+add `--oauth-manual-callback`: mcp2cli prints the authorization URL instead of opening a
+browser, and reads the redirect back from stdin.
+
+```bash
+mcp2cli --mcp https://mcp.linear.app/mcp --oauth --oauth-manual-callback --list
+```
+
+Open the printed URL in a browser on any machine, authorize, then paste the URL you land
+on. That page will fail to load — nothing is listening on the loopback port — which is
+expected; only its address matters, because it carries the `code` and `state` parameters.
+PKCE and state verification are unchanged, so paste the URL unmodified.
+
 ### Secrets from environment or files
 
 Sensitive values (`--auth-header` values, `--oauth-client-id`, `--oauth-client-secret`) support
@@ -122,6 +138,30 @@ mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" \
 mcp2cli --mcp-stdio "node server.js" --env API_KEY=sk-... --env DEBUG=1 \
   search --query "test"
 ```
+
+### MCP roots and completion
+
+Expose one or more filesystem roots when a server scopes operations to a
+workspace. Paths are converted to `file://` URIs; explicit roots must also use
+the `file://` scheme.
+
+```bash
+mcp2cli --mcp-stdio "npx @modelcontextprotocol/server-filesystem /tmp" \
+  --root "$PWD" --root file:///var/shared --list
+```
+
+Request prompt-argument or resource-template completions with
+`REF:ARG=PREFIX`:
+
+```bash
+mcp2cli --mcp https://example.com/mcp \
+  --complete "greeting:name=San"
+mcp2cli --mcp https://example.com/mcp \
+  --complete "file:///docs/{topic}:topic=api"
+```
+
+Both options work when starting a persistent session; roots are retained by
+the session daemon and completion requests can be sent through `--session`.
 
 ### OpenAPI mode
 
@@ -303,10 +343,14 @@ Options:
   --base-url URL          Override base URL from spec
   --transport TYPE        MCP HTTP transport: auto|sse|streamable (default: auto)
   --env KEY=VALUE         Env var for MCP stdio server (repeatable)
+  --root PATH|FILE_URI    Expose a filesystem root to an MCP server (repeatable)
+  --complete SPEC         Complete an MCP prompt or resource-template argument
   --oauth                 Enable OAuth (authorization code + PKCE flow)
   --oauth-client-id ID    OAuth client ID (supports env:/file: prefixes)
   --oauth-client-secret S OAuth client secret (supports env:/file: prefixes)
   --oauth-scope SCOPE     OAuth scope(s) to request
+  --oauth-manual-callback Print the auth URL and read the redirect from stdin
+                          (for hosts with no reachable browser)
   --cache-key KEY         Custom cache key
   --cache-ttl SECONDS     Cache TTL (default: 3600)
   --refresh               Bypass cache
@@ -346,19 +390,29 @@ Subcommands and their flags are generated dynamically from the spec or MCP serve
 # Install with test + MCP deps
 uv sync --extra test
 
-# Run tests (96 tests covering OpenAPI, MCP stdio, MCP HTTP, caching, and token savings)
+# Run tests
 uv run pytest tests/ -v
 
 # Run just the token savings tests
 uv run pytest tests/test_token_savings.py -v -s
 ```
 
+### MCP SDK compatibility
+
+mcp2cli works with **both major versions** of the MCP Python SDK (`mcp>=1.26,<3`),
+so it never forces a resolver conflict with other tools in the same environment.
+CI runs the suite against the declared floor, the latest 1.x, and the latest 2.x.
+
+The two majors differ in ways that matter to a client — v2 renamed model fields
+to snake_case, replaced `streamablehttp_client`, moved to `httpx2`, and dropped
+the session-id element from the transport tuple. Those differences are confined
+to a handful of helpers (`_mcp_attr`, `_mcp_dump`, `_streamable_streams`,
+`_list_tools_page`, `_resource_uri`, `_authorization_code_result`); the rest of
+the codebase is version-agnostic. The test fixtures speak the JSON-RPC wire
+protocol directly and import no SDK, so they hold across majors.
+
 ---
 
 ## License
 
 [MIT](LICENSE)
-
----
-
-<sub>mcp2cli builds on ideas from [CLIHub](https://kanyilmaz.me/2026/02/23/cli-vs-mcp.html) by Kagan Yilmaz (CLI-based tool access for token efficiency)</sub>

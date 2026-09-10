@@ -10,6 +10,7 @@ import pytest
 from mcp2cli import (
     CommandDef,
     ParamDef,
+    _ensure_utf8_output,
     command_to_dict,
     output_result,
     print_commands_json,
@@ -62,6 +63,12 @@ class TestOutputResultJson:
         out = capsys.readouterr().out
         assert "\n  " in out
         assert json.loads(out) == {"a": 1}
+
+    def test_non_ascii_emitted_as_utf8(self, capsys):
+        output_result({"content": ["返回首页"]}, json_output=True)
+        out = capsys.readouterr().out
+        assert "\\u" not in out
+        assert json.loads(out) == {"content": ["返回首页"]}
 
 
 # ---------------------------------------------------------------------------
@@ -248,35 +255,6 @@ class TestMCPStdioJson:
 
 
 class TestMCPHttpJson:
-    @pytest.fixture(scope="class")
-    def mcp_http_server(self):
-        import time
-
-        server_script = Path(__file__).parent / "_mcp_http_server.py"
-        proc = subprocess.Popen(
-            [sys.executable, str(server_script)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        port = None
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            line = proc.stdout.readline().strip()
-            if line.startswith("PORT="):
-                port = int(line.split("=")[1])
-                break
-            if proc.poll() is not None:
-                pytest.skip(f"MCP HTTP server failed: {proc.stderr.read()}")
-                return
-        if port is None:
-            proc.kill()
-            pytest.skip("MCP HTTP server did not report port in time")
-            return
-        yield f"http://127.0.0.1:{port}/sse"
-        proc.terminate()
-        proc.wait(timeout=5)
-
     def _run(self, url, *args):
         cmd = [sys.executable, "-m", "mcp2cli", "--mcp", url, *args]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -323,3 +301,54 @@ class TestGraphQLJson:
         data = json.loads(r.stdout)
         assert isinstance(data, list)
         assert data[0]["name"] == "Alice"
+
+
+class TestEnsureUtf8Output:
+    """ensure_ascii=False (#62) must not become a crash on legacy consoles."""
+
+    def test_reconfigures_stream_to_utf8(self, monkeypatch):
+        import io
+
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp936")
+        monkeypatch.setattr(sys, "stdout", stream)
+        monkeypatch.setattr(sys, "stderr", stream)
+        _ensure_utf8_output()
+        assert stream.encoding.lower().replace("-", "") == "utf8"
+
+    def test_non_ascii_survives_a_cp936_pipe(self, monkeypatch):
+        """The regression this guards: a CJK payload down a non-UTF-8 pipe."""
+        import io
+
+        raw = io.BytesIO()
+        monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp936"))
+        monkeypatch.setattr(sys, "stderr", sys.stdout)
+        _ensure_utf8_output()
+        output_result({"content": ["返回首页"]}, json_output=True)
+        sys.stdout.flush()
+        assert json.loads(raw.getvalue().decode("utf-8")) == {"content": ["返回首页"]}
+
+    def test_stream_without_reconfigure_is_left_alone(self, monkeypatch):
+        class Bare:
+            encoding = "ascii"
+
+        monkeypatch.setattr(sys, "stdout", Bare())
+        monkeypatch.setattr(sys, "stderr", Bare())
+        _ensure_utf8_output()  # must not raise
+
+    def test_unreconfigurable_stream_falls_back_to_escapes(self, monkeypatch):
+        """If UTF-8 is refused, degrade to the pre-#62 shape, never crash."""
+        calls = []
+
+        class Stubborn:
+            encoding = "cp936"
+
+            def reconfigure(self, **kwargs):
+                calls.append(kwargs)
+                if "encoding" in kwargs:
+                    raise OSError("cannot change encoding")
+
+        stream = Stubborn()
+        monkeypatch.setattr(sys, "stdout", stream)
+        monkeypatch.setattr(sys, "stderr", stream)
+        _ensure_utf8_output()
+        assert {"errors": "backslashreplace"} in calls

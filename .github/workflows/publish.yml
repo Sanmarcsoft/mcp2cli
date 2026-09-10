@@ -1,16 +1,60 @@
-name: Publish to PyPI
+name: CI
 
 on:
   push:
     branches: [main]
+  pull_request:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+        # mcp2cli supports both MCP SDK majors (issue #74), so all three are
+        # tested: the declared floor, the latest 1.x, and the latest 2.x.
+        # Testing a single pinned SDK is how the 2.0.0 break reached users
+        # while CI stayed green (issue #68).
+        mcp: ["mcp==1.26.0", "mcp<2", "mcp>=2,<3"]
+    name: test (py${{ matrix.python }}, ${{ matrix.mcp }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1 (node24)
+        with:
+          # One cache key per matrix cell: setup-uv v10 caches by default, and six
+          # jobs sharing one key race to save it ("Unable to reserve cache").
+          cache-suffix: py${{ matrix.python }}-${{ matrix.mcp }}
+
+      - run: uv venv --python ${{ matrix.python }}
+
+      # --no-deps, then install the matrix SDK explicitly, so the pin under
+      # test is the one that gets exercised rather than whatever resolves.
+      - run: uv pip install -e . --no-deps
+      - run: uv pip install "${{ matrix.mcp }}" httpx pyyaml pytest pytest-asyncio tiktoken
+
+      # The --toon tests assert real encoder output. Installing the CLI here
+      # puts `toon` on PATH, so they exercise it deterministically instead of
+      # relying on npx fetching the package mid-test: runners ship npx but not
+      # the package, and that implicit download raced _toon_encode's 10s
+      # timeout — 5 matrix jobs won it, 1 lost, so main went red at random.
+      - run: npm install -g @toon-format/cli
+
+      - name: Report resolved versions
+        run: .venv/bin/python -c "import importlib.metadata as m; print('mcp', m.version('mcp'))"
+
+      - run: .venv/bin/python -m pytest -q
+
   publish:
+    needs: test
+    # The fork has no PyPI token and must not publish.
+    if: github.event_name == 'push' && github.repository == 'knowsuchagency/mcp2cli'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1 (node24)
 
       - run: uv build
 
