@@ -22,6 +22,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1 (node24)
+        with:
+          # One cache key per matrix cell: setup-uv v10 caches by default, and six
+          # jobs sharing one key race to save it ("Unable to reserve cache").
+          cache-suffix: py${{ matrix.python }}-${{ matrix.mcp }}
 
       - run: uv venv --python ${{ matrix.python }}
 
