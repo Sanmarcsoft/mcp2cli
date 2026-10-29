@@ -20,14 +20,15 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from datetime import datetime, timezone
 
@@ -91,13 +92,15 @@ def _write_private(path: Path, text: str) -> None:
 class ParamDef:
     name: str  # kebab-case CLI flag
     original_name: str  # original name for API/tool call
-    python_type: type | None  # None means boolean (store_true)
+    python_type: type | None  # None means boolean (--flag / --no-flag)
     required: bool = False
     description: str = ""
     choices: list | None = None
     location: str = "body"  # path|query|header|body|tool_input
     schema: dict = field(default_factory=dict)
     cli_name: str | None = None  # collision-free argparse flag name
+    style: str | None = None  # OpenAPI parameter serialization
+    explode: bool = False
 
 
 @dataclass
@@ -222,6 +225,72 @@ def read_stdin_json(context: str):
         )
         sys.exit(1)
 
+_STDIN_MERGE_LOCATIONS = ("body", "tool_input", "graphql_arg")
+
+
+def _merge_stdin_flag_args(data, cmd, args, context: str):
+    """Merge explicitly passed parameter flags into the --stdin JSON object.
+
+    Without this, --stdin used the JSON verbatim and silently dropped every
+    parameter flag given alongside it. A flag that disagrees with the same key
+    in the JSON is an error rather than a silent override in either direction.
+    """
+    flags = {}
+    for p in cmd.params:
+        val = getattr(args, _param_dest(p), None)
+        if val is None:
+            continue
+        flag = f"--{p.cli_name or p.name}"
+        if p.location == "file":
+            print(f"Error: {flag} cannot be combined with --stdin.", file=sys.stderr)
+            sys.exit(1)
+        if p.location in _STDIN_MERGE_LOCATIONS:
+            flags[p.original_name] = (flag, coerce_value(val, p.schema))
+    if not flags:
+        return data
+    if not isinstance(data, dict):
+        names = ", ".join(flag for flag, _ in flags.values())
+        print(
+            f"Error: {names} can only be merged into a JSON object on --stdin "
+            f"for {context}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    merged = dict(data)
+    conflicts = []
+    for key, (flag, value) in flags.items():
+        if key in merged and merged[key] != value:
+            conflicts.append(
+                f"{flag} {json.dumps(value)} vs \"{key}\": {json.dumps(merged[key])}"
+            )
+        merged[key] = value
+    if conflicts:
+        print(
+            f"Error: flags conflict with the --stdin JSON for {context}: "
+            + "; ".join(conflicts)
+            + ". Pass each value in one place, or make them agree.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return merged
+
+
+def split_shell_command(command: str) -> list[str]:
+    """Split a shell-style command string into an argv list.
+
+    ``shlex.split`` defaults to POSIX rules, which treat backslash as an escape
+    and therefore mangle native Windows paths (``D:\\tools\\python.exe`` becomes
+    ``D:toolspython.exe``).  On Windows keep the backslashes and strip any
+    surrounding quotes instead.
+    """
+    if os.name == "nt":
+        parts = shlex.split(command, posix=False)
+        return [
+            p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'" else p
+            for p in parts
+        ]
+    return shlex.split(command)
+
 
 def _normalize_schema_type(t):
     """JSON Schema allows "type": ["integer", "null"] (array form). Reduce it
@@ -230,6 +299,87 @@ def _normalize_schema_type(t):
         concrete = [x for x in t if x != "null"]
         return concrete[0] if len(concrete) == 1 else None
     return t
+
+
+def _collapse_nullable(schema: dict) -> dict:
+    """Pydantic (FastMCP, FastAPI) writes Optional[T] as
+    {"anyOf": [{T}, {"type": "null"}]} with no top-level "type". Reduce that
+    to {T}, keeping outer keys such as description; anything else passes
+    through."""
+    if not isinstance(schema, dict) or "type" in schema:
+        return schema
+    unions = [k for k in ("anyOf", "oneOf") if k in schema]
+    if len(unions) != 1 or not isinstance(schema[unions[0]], list):
+        return schema
+    branches = schema[unions[0]]
+    concrete = [b for b in branches if not (isinstance(b, dict) and b.get("type") == "null")]
+    if len(branches) != 2 or len(concrete) != 1 or not isinstance(concrete[0], dict):
+        return schema
+    outer = {k: v for k, v in schema.items() if k != unions[0]}
+    return {**concrete[0], **outer}
+
+
+def _union_branch_types(schema: dict) -> set[str]:
+    """Collect the JSON types an anyOf/oneOf union admits, recursing into
+    nested unions. A branch without a usable "type" (a bare const, a $ref)
+    counts as "other": it may accept non-numeric values."""
+    types: set[str] = set()
+    alternatives = schema.get("anyOf") or schema.get("oneOf") or []
+    if not isinstance(alternatives, list):
+        return types
+    for alt in alternatives:
+        if not isinstance(alt, dict):
+            types.add("other")
+            continue
+        t = alt.get("type")
+        if isinstance(t, list):
+            types.update(x for x in t if isinstance(x, str))
+        elif isinstance(t, str):
+            types.add(t)
+        elif alt.get("anyOf") or alt.get("oneOf"):
+            types |= _union_branch_types(alt)
+        else:
+            types.add("other")
+    return types
+
+
+def _union_prefer_numeric(schema: dict):
+    """Pick an argparse type for an anyOf/oneOf union with a numeric branch.
+
+    Returns None when no branch is integer/number, so callers fall back to
+    default logic. A purely numeric union gets int or float. A union that also
+    admits other values (the common MCP pattern
+    ``anyOf: [{type: string, const: ""}, {type: integer, minimum: 1}]``, or a
+    plain ``int | str``) gets a converter that sends the value as a number
+    when it parses as one and keeps the string otherwise, so ``--precision 6``
+    goes out as 6 while ``--id abc`` still goes out as "abc".
+    """
+    types = _union_branch_types(schema)
+    converters = []
+    if "integer" in types:
+        converters.append(int)
+    if "number" in types:
+        converters.append(float)
+    if not converters:
+        return None
+    keeps_string = bool(types - {"integer", "number", "null"})
+    if len(converters) == 1 and not keeps_string:
+        return converters[0]
+
+    def convert(value: str):
+        for conv in converters:
+            try:
+                return conv(value)
+            except ValueError:
+                pass
+        if keeps_string:
+            return value
+        raise ValueError(value)
+
+    convert.__name__ = "|".join(
+        [c.__name__ for c in converters] + (["str"] if keeps_string else [])
+    )
+    return convert
 
 
 def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
@@ -254,6 +404,13 @@ def schema_type_to_python(schema: dict) -> tuple[type | None, str]:
                 return int, ""
             if all(isinstance(v, (int, float)) for v in enum):
                 return float, ""
+    # No "type" but an anyOf/oneOf union with a numeric branch: send numbers
+    # as numbers (see _union_prefer_numeric). A top-level "type" constrains
+    # every branch, so it wins and is handled above.
+    if t is None and (schema.get("anyOf") is not None or schema.get("oneOf") is not None):
+        union_type = _union_prefer_numeric(schema)
+        if union_type is not None:
+            return union_type, ""
     return str, ""
 
 
@@ -456,17 +613,20 @@ async def _list_tools_page(session, cursor: str | None):
     return await session.list_tools(params=params)
 
 
-def _authorization_code_result(code: str, state: str | None):
+def _authorization_code_result(code: str, state: str | None, iss: str | None = None):
     """Wrap a callback result in whatever ``callback_handler`` must return.
 
     v1 expects a plain ``(code, state)`` tuple; v2 expects an
-    ``AuthorizationCodeResult`` model.
+    ``AuthorizationCodeResult`` model. ``iss`` is the RFC 9207
+    authorization-response issuer: when the authorization server advertises it
+    in its metadata, the SDK validates the redirect's ``iss`` and fails the
+    flow if the value never reaches it.
     """
     try:
         from mcp.shared.auth import AuthorizationCodeResult
     except ImportError:
         return (code, state)
-    return AuthorizationCodeResult(code=code, state=state)
+    return AuthorizationCodeResult(code=code, state=state, iss=iss)
 
 
 def _ensure_utf8_output() -> None:
@@ -491,7 +651,6 @@ def _ensure_utf8_output() -> None:
                 reconfigure(errors="backslashreplace")
             except Exception:
                 pass
-
 
 
 def _apply_head(data, n: int):
@@ -674,18 +833,65 @@ def cache_key_for(config: dict) -> str:
     ).hexdigest()[:16]
 
 def load_cached(key: str, ttl: int) -> dict | None:
+    """Read a cache entry, or None when it is missing, stale or unusable.
+
+    A corrupt entry is treated as a miss rather than an error. The cache is
+    an optimisation, so a bad file should cost one refetch -- not every
+    later invocation, until someone works out which file to delete by hand.
+    This matches _load_usage() and _load_baked_all(), which already tolerate
+    exactly this.
+    """
     path = CACHE_DIR / f"{key}.json"
     if not path.exists():
         return None
-    age = time.time() - path.stat().st_mtime
-    if age >= ttl:
+    try:
+        age = time.time() - path.stat().st_mtime
+        if age >= ttl:
+            return None
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
-    return json.loads(path.read_text())
 
 
 def save_cache(key: str, data: dict):
+    """Write a cache entry atomically.
+
+    A plain write_text() is not atomic: an interrupt, a full disk or two
+    concurrent mcp2cli runs can leave a half-written file behind, which is
+    how a cache entry becomes corrupt in the first place. Serialise first,
+    write to a freshly created private temp file in the same directory, then
+    os.replace() it into place -- readers only ever observe the old file or
+    the new one.
+
+    The temp file comes from tempfile.mkstemp(), so every writer gets storage
+    of its own. A pid-derived name does not: two threads of one process share
+    it, and each open() truncates whatever the other has written so far, so
+    the file that gets replaced into place is a splice of both payloads.
+
+    Any failure -- including Ctrl-C -- removes the temp file and leaves the
+    entry already on disk untouched.
+
+    The directory stays 0o700 (fork control); mkstemp already creates the
+    temp file 0o600, so os.replace() lands a private file.
+    """
     _mkdir_private(CACHE_DIR)
-    _write_private(CACHE_DIR / f"{key}.json", json.dumps(data))
+    path = CACHE_DIR / f"{key}.json"
+    payload = json.dumps(data)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(CACHE_DIR), prefix=f"{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +1088,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
     auth_code: str | None = None
     state: str | None = None
+    iss: str | None = None
     error: str | None = None
     done = threading.Event()
 
@@ -894,6 +1101,10 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         elif "code" in params:
             _CallbackHandler.auth_code = params["code"][0]
             _CallbackHandler.state = params.get("state", [None])[0]
+            # RFC 9207: an absent issuer must stay absent -- the SDK only
+            # rejects a missing ``iss`` when the server advertised it, and an
+            # empty ``iss=`` would instead fail as a mismatch.
+            _CallbackHandler.iss = params.get("iss", [None])[0] or None
 
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -920,17 +1131,22 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _parse_oauth_callback_input(text: str) -> tuple[str, str]:
-    """Extract ``(code, state)`` from a pasted OAuth callback URL.
+def _parse_oauth_callback_input(text: str) -> tuple[str, str, str | None]:
+    """Extract ``(code, state, iss)`` from a pasted OAuth callback URL.
 
     Accepts the full redirect target the browser landed on
     (``http://127.0.0.1:1234/callback?code=...&state=...``) or just its query
     string. PKCE and CSRF verification stay in the MCP SDK -- we only hand it
-    the two values it asks for. The SDK compares ``state`` against the one it
+    the values it asks for. The SDK compares ``state`` against the one it
     generated with ``secrets.compare_digest`` and treats ``None`` as a
     mismatch, so a paste missing ``state`` is rejected here with a readable
     message instead of surfacing as an opaque
     ``State parameter mismatch: None != ...``.
+
+    ``iss`` is optional in the redirect but mandatory to forward: under
+    RFC 9207 the SDK validates it whenever the authorization server advertises
+    it, and dropping it fails the flow with "Authorization response missing
+    iss parameter advertised by the authorization server".
     """
     text = text.strip().strip("'\"")
     if not text:
@@ -950,10 +1166,13 @@ def _parse_oauth_callback_input(text: str) -> tuple[str, str]:
             "That URL has no 'state' parameter. Paste the URL unmodified -- "
             "the MCP SDK verifies state to prevent CSRF and rejects a missing one."
         )
-    return params["code"][0], params["state"][0]
+    # ``or None``: an empty ``iss=`` is treated as absent, which the SDK
+    # accepts unless the server advertised the parameter, rather than as a
+    # mismatching issuer.
+    return params["code"][0], params["state"][0], params.get("iss", [None])[0] or None
 
 
-def _prompt_oauth_callback(attempts: int = 3) -> tuple[str, str]:
+def _prompt_oauth_callback(attempts: int = 3) -> tuple[str, str, str | None]:
     """Read the OAuth callback URL from stdin.
 
     For hosts with no reachable browser -- a VPS over SSH, a container.
@@ -975,8 +1194,6 @@ def _prompt_oauth_callback(attempts: int = 3) -> tuple[str, str]:
             if not remaining:
                 raise
             print(f"{exc} ({remaining} attempt(s) left)", file=sys.stderr)
-
-
 
 
 def _get_cached_redirect_uri(storage: "FileTokenStorage") -> str | None:
@@ -1331,12 +1548,13 @@ def build_oauth_provider(
             )
 
         async def callback_handler():
-            code, state = await anyio.to_thread.run_sync(_prompt_oauth_callback)
-            return _authorization_code_result(code, state)
+            code, state, iss = await anyio.to_thread.run_sync(_prompt_oauth_callback)
+            return _authorization_code_result(code, state, iss)
     else:
         # Reset callback handler state
         _CallbackHandler.auth_code = None
         _CallbackHandler.state = None
+        _CallbackHandler.iss = None
         _CallbackHandler.error = None
         _CallbackHandler.done = threading.Event()
 
@@ -1369,7 +1587,9 @@ def build_oauth_provider(
             if not _CallbackHandler.auth_code:
                 raise RuntimeError("No authorization code received")
             return _authorization_code_result(
-                _CallbackHandler.auth_code, _CallbackHandler.state
+                _CallbackHandler.auth_code,
+                _CallbackHandler.state,
+                _CallbackHandler.iss,
             )
 
     return _RobustOAuthClientProvider(
@@ -1386,8 +1606,70 @@ def build_oauth_provider(
 # ---------------------------------------------------------------------------
 
 
+def _json_pointer_unescape(token: str) -> str:
+    """Decode RFC 6901 escapes: ``~1`` is ``/`` and ``~0`` is ``~``.
+
+    Order matters -- ``~1`` first, or ``~01`` would wrongly become ``/``.
+    """
+    return token.replace("~1", "/").replace("~0", "~")
+
+
+def _json_pointer_tokens(fragment: str) -> list[str]:
+    """Split a URI fragment into decoded JSON Pointer reference tokens.
+
+    A ``$ref`` is a URI, so RFC 6901 section 6 percent-encodes the pointer it
+    carries in the fragment. Decoding therefore unwinds the two layers in the
+    order they were applied: percent-decode the whole fragment first, then
+    split on the ``/`` separators it now spells out, then decode the ``~``
+    escapes the encoding was applied over. A member name holding a ``/`` is
+    ``~1`` (or ``%7E1``), a ``~`` is ``~0``, and a literal ``%`` is ``%25``.
+    """
+    return [_json_pointer_unescape(t) for t in unquote(fragment).split("/")]
+
+
+# RFC 6901: an array index is "0", or a digit string with no leading zero.
+# ``int()`` is far more generous -- it accepts "-1" (which would silently
+# select the *last* element), "+1", "01", " 1 ", "1_0" and Unicode digits --
+# so a token is screened before conversion.
+_ARRAY_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
+
+
+def _array_index(token: str, length: int) -> int | None:
+    """Index *token* addresses in a list of *length*, or None if it does not."""
+    if not length or not _ARRAY_INDEX_RE.fullmatch(token):
+        return None
+    # Both strings are canonical decimals, so (width, lexicographic) orders
+    # them numerically. Comparing them before converting keeps a spec from
+    # handing int() an arbitrarily long digit run, where CPython's
+    # integer-string conversion limit -- which a host may raise or disable --
+    # would decide what happens instead of us.
+    largest = str(length - 1)
+    if (len(token), token) > (len(largest), largest):
+        return None
+    return int(token)
+
+
+def _json_pointer_lookup(root, tokens: list[str]):
+    """Walk *root* by decoded pointer tokens. Raises LookupError on a dangle."""
+    target = root
+    for token in tokens:
+        if isinstance(target, dict):
+            if token not in target:
+                raise LookupError(token)
+            target = target[token]
+        elif isinstance(target, list):
+            index = _array_index(token, len(target))
+            if index is None:
+                raise LookupError(token)
+            target = target[index]
+        else:
+            raise LookupError(token)
+    return target
+
+
 def resolve_refs(spec: dict) -> dict:
     spec = copy.deepcopy(spec)
+    warned: set[str] = set()
 
     def _resolve(node, root, seen):
         if isinstance(node, dict):
@@ -1397,10 +1679,23 @@ def resolve_refs(spec: dict) -> dict:
                     return node
                 seen = seen | {ref}
                 if ref.startswith("#/"):
-                    parts = ref[2:].split("/")
-                    target = root
-                    for p in parts:
-                        target = target[p]
+                    try:
+                        target = _json_pointer_lookup(
+                            root, _json_pointer_tokens(ref[2:])
+                        )
+                    except LookupError:
+                        # A dangling reference in a spec we did not write must
+                        # not take down the CLI. Leave the node unresolved --
+                        # the same shape external refs and cycles already
+                        # produce -- and say so once.
+                        if ref not in warned:
+                            warned.add(ref)
+                            print(
+                                f"Warning: unresolvable $ref {ref!r} in spec; "
+                                "leaving it unresolved.",
+                                file=sys.stderr,
+                            )
+                        return node
                     return _resolve(copy.deepcopy(target), root, seen)
                 return node
             return {k: _resolve(v, root, seen) for k, v in node.items()}
@@ -1469,32 +1764,98 @@ def load_openapi_spec(
 # ---------------------------------------------------------------------------
 
 
-def extract_openapi_commands(spec: dict) -> list[CommandDef]:
-    commands: list[CommandDef] = []
-    seen_names: dict[str, int] = {}
+def _merge_openapi_parameters(path_level, operation_level) -> list[dict]:
+    """Combine path-item parameters with an operation's own.
 
+    OpenAPI 3.x declares that ``parameters`` on a path item apply to every
+    operation under that path. An operation may *override* an inherited
+    parameter by redeclaring the same ``name``/``in`` pair, but it cannot
+    remove one. Operation-level entries therefore win on collision, and the
+    inherited ones are kept otherwise.
+
+    Malformed entries (non-dicts, or missing ``name``) are skipped rather
+    than raising: a spec we did not write should not crash the CLI.
+    """
+    merged: dict[tuple[str, str], dict] = {}
+    for group in (path_level, operation_level):
+        if not isinstance(group, list):
+            continue
+        for param in group:
+            if not isinstance(param, dict) or "name" not in param:
+                continue
+            merged[(param["name"], param.get("in", "query"))] = param
+    return list(merged.values())
+_OPENAPI_METHODS = ("get", "post", "put", "delete", "patch")
+
+
+def _openapi_operation_name(path: str, method: str, details: dict) -> str:
+    """The natural CLI name for an operation, before collision handling."""
+    op_id = details.get("operationId")
+    if op_id:
+        return to_kebab(op_id)
+    slug = path.strip("/").replace("/", "-").replace("{", "").replace("}", "")
+    return f"{method}-{slug}" if slug else method
+
+
+def _openapi_natural_names(spec: dict) -> set[str]:
+    """Every operation's natural name, so an alias can never shadow one."""
+    names: set[str] = set()
     for path, methods in spec.get("paths", {}).items():
         if not isinstance(methods, dict):
             continue
         for method, details in methods.items():
-            if method not in ("get", "post", "put", "delete", "patch"):
+            if method not in _OPENAPI_METHODS or not isinstance(details, dict):
+                continue
+            names.add(_openapi_operation_name(path, method, details))
+    return names
+
+
+def _unique_openapi_name(
+    name: str, method: str, reserved: set[str], used: set[str]
+) -> str:
+    """Return a free CLI name for an operation.
+
+    The first operation to claim a name keeps it. A later collision is
+    disambiguated by the HTTP method, and then by a numeric suffix if that is
+    taken too. A generated alias is never allowed to equal another
+    operation's natural name, which would make that operation unreachable.
+    """
+    if name not in used:
+        return name
+    candidate = f"{name}-{method}"
+    if candidate not in reserved and candidate not in used:
+        return candidate
+    suffix = 2
+    while True:
+        numbered = f"{candidate}-{suffix}"
+        if numbered not in reserved and numbered not in used:
+            return numbered
+        suffix += 1
+
+
+def extract_openapi_commands(spec: dict) -> list[CommandDef]:
+    commands: list[CommandDef] = []
+    natural_names = _openapi_natural_names(spec)
+    used_names: set[str] = set()
+
+    for path, methods in spec.get("paths", {}).items():
+        if not isinstance(methods, dict):
+            continue
+        # Applies to every operation under this path (OpenAPI 3.x).
+        shared_params = methods.get("parameters")
+        for method, details in methods.items():
+            if method not in _OPENAPI_METHODS:
                 continue
             if not isinstance(details, dict):
                 continue
 
-            op_id = details.get("operationId")
-            if op_id:
-                name = to_kebab(op_id)
-            else:
-                slug = (
-                    path.strip("/").replace("/", "-").replace("{", "").replace("}", "")
-                )
-                name = f"{method}-{slug}" if slug else method
-
-            if name in seen_names:
-                seen_names[name] += 1
-                name = f"{name}-{method}"
-            seen_names[name] = 1
+            name = _unique_openapi_name(
+                _openapi_operation_name(path, method, details),
+                method,
+                natural_names,
+                used_names,
+            )
+            used_names.add(name)
 
             desc = (
                 details.get("summary")
@@ -1503,9 +1864,12 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
             )
             params: list[ParamDef] = []
 
-            # Parameters (path, query, header)
-            for param in details.get("parameters", []):
-                schema = param.get("schema", {})
+            # Parameters (path, query, header) -- inherited from the
+            # path item, then overridden by the operation's own.
+            for param in _merge_openapi_parameters(
+                shared_params, details.get("parameters")
+            ):
+                schema = _collapse_nullable(param.get("schema", {}))
                 py_type, suffix = schema_type_to_python(schema)
                 p = ParamDef(
                     name=to_kebab(param["name"]),
@@ -1516,6 +1880,12 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
                     choices=schema.get("enum"),
                     location=param.get("in", "query"),
                     schema=schema,
+                    style=param.get("style"),
+                    explode=param.get(
+                        "explode",
+                        param.get("in", "query") == "query"
+                        and param.get("style", "form") == "form",
+                    ),
                 )
                 params.append(p)
 
@@ -1547,6 +1917,7 @@ def extract_openapi_commands(spec: dict) -> list[CommandDef]:
             has_body = bool(properties)
 
             for prop_name, prop_schema in properties.items():
+                prop_schema = _collapse_nullable(prop_schema)
                 is_binary = (
                     cmd_content_type == "multipart/form-data"
                     and prop_schema.get("format") == "binary"
@@ -1624,6 +1995,7 @@ def extract_mcp_commands(tools: list[dict]) -> list[CommandDef]:
         params: list[ParamDef] = []
 
         for prop_name, prop_schema in schema.get("properties", {}).items():
+            prop_schema = _collapse_nullable(prop_schema)
             py_type, suffix = schema_type_to_python(prop_schema)
             params.append(
                 ParamDef(
@@ -1783,7 +2155,7 @@ def graphql_type_to_python(
         "ID": str,
         "Int": int,
         "Float": float,
-        "Boolean": None,  # store_true
+        "Boolean": None,  # boolean flag
     }
     py_type = scalar_map.get(type_name, str)
     return py_type, is_non_null, None
@@ -1928,6 +2300,29 @@ def _build_graphql_param(arg: dict, types_by_name: dict) -> ParamDef:
     )
 
 
+def _unique_graphql_name(
+    name: str, op_type: str, reserved: set[str], used: set[str]
+) -> str:
+    """Return a free CLI name for a GraphQL field.
+
+    The first field to claim a name keeps it. A later collision is
+    disambiguated by the operation type, then by a numeric suffix if that is
+    taken too. A generated alias is never allowed to equal another field's
+    own name, which would make that field unreachable.
+    """
+    if name not in used:
+        return name
+    candidate = f"{op_type}-{name}"
+    if candidate not in reserved and candidate not in used:
+        return candidate
+    suffix = 2
+    while True:
+        numbered = f"{candidate}-{suffix}"
+        if numbered not in reserved and numbered not in used:
+            return numbered
+        suffix += 1
+
+
 def extract_graphql_commands(schema: dict) -> list[CommandDef]:
     """Convert introspection schema into CommandDef list."""
     types_by_name = {t["name"]: t for t in schema.get("types", []) if t.get("name")}
@@ -1936,46 +2331,52 @@ def extract_graphql_commands(schema: dict) -> list[CommandDef]:
     mutation_type_name = (schema.get("mutationType") or {}).get("name")
 
     commands: list[CommandDef] = []
-    seen_names: set[str] = set()
 
     query_fields = types_by_name.get(query_type_name, {}).get("fields", []) if query_type_name else []
     mutation_fields = types_by_name.get(mutation_type_name, {}).get("fields", []) if mutation_type_name else []
     collisions = _detect_field_collisions(query_fields, mutation_fields)
 
-    for op_type, type_name, fields in [
-        ("query", query_type_name, query_fields),
-        ("mutation", mutation_type_name, mutation_fields),
-    ]:
+    # Pass 1: every field's natural CLI name. A field whose *wire* name exists
+    # under both Query and Mutation is prefixed with its operation type on both
+    # sides, which is the pre-existing symmetric naming and is kept as-is.
+    entries: list[tuple[str, str, dict]] = []
+    for op_type, fields in (("query", query_fields), ("mutation", mutation_fields)):
         for field_def in fields:
             field_name = field_def["name"]
             if field_name.startswith("__"):
                 continue
-
-            cli_name = to_kebab(field_name)
+            base = to_kebab(field_name)
             if field_name in collisions:
-                cli_name = f"{op_type}-{cli_name}"
+                base = f"{op_type}-{base}"
+            entries.append((base, op_type, field_def))
 
-            if cli_name in seen_names:
-                cli_name = f"{op_type}-{cli_name}"
-            seen_names.add(cli_name)
+    # Pass 2: allocate against the complete set of natural names, so a
+    # generated alias can never shadow a field that owns that name.
+    reserved = {base for base, _, _ in entries}
+    used: set[str] = set()
 
-            desc = field_def.get("description") or f"{op_type} {field_name}"
-            params = [
-                _build_graphql_param(arg, types_by_name)
-                for arg in field_def.get("args", [])
-            ]
+    for base, op_type, field_def in entries:
+        field_name = field_def["name"]
+        cli_name = _unique_graphql_name(base, op_type, reserved, used)
+        used.add(cli_name)
 
-            commands.append(
-                CommandDef(
-                    name=cli_name,
-                    description=desc,
-                    params=params,
-                    has_body=bool(params),
-                    graphql_operation_type=op_type,
-                    graphql_field_name=field_name,
-                    graphql_return_type=field_def.get("type"),
-                )
+        desc = field_def.get("description") or f"{op_type} {field_name}"
+        params = [
+            _build_graphql_param(arg, types_by_name)
+            for arg in field_def.get("args", [])
+        ]
+
+        commands.append(
+            CommandDef(
+                name=cli_name,
+                description=desc,
+                params=params,
+                has_body=bool(params),
+                graphql_operation_type=op_type,
+                graphql_field_name=field_name,
+                graphql_return_type=field_def.get("type"),
             )
+        )
 
     return commands
 
@@ -2057,7 +2458,9 @@ def _build_graphql_document(
 
     # Build variables dict from args
     if getattr(args, "stdin", False) is True:
-        variables = read_stdin_json("GraphQL variables")
+        variables = _merge_stdin_flag_args(
+            read_stdin_json("GraphQL variables"), cmd, args, "GraphQL variables"
+        )
     else:
         variables = {}
         for p in cmd.params:
@@ -2454,6 +2857,21 @@ def _bake_list() -> None:
         print(f"{name:<20} {st:<10} {src:<50}")
 
 
+def _mask_secret(value: str) -> str:
+    """Mask a secret for display.
+
+    ``env:`` and ``file:`` values are references, not secrets, and stay
+    readable so the config remains diagnosable.
+    """
+    if value.startswith("env:") or value.startswith("file:"):
+        return value
+    return value[:4] + "****" if len(value) > 4 else "****"
+
+
+# Baked-config fields whose values must never be printed in the clear.
+_SECRET_BAKE_FIELDS = ("oauth_client_secret",)
+
+
 def _bake_show(argv: list[str]) -> None:
     p = argparse.ArgumentParser(prog="mcp2cli bake show")
     p.add_argument("name")
@@ -2462,17 +2880,76 @@ def _bake_show(argv: list[str]) -> None:
     if cfg is None:
         print(f"Error: no baked tool named '{args.name}'", file=sys.stderr)
         sys.exit(1)
-    # Mask secrets in auth headers for display
+    # Mask secrets for display: auth header values and any secret-bearing
+    # top-level field (the README promises `bake show` output is safe to
+    # share).
     display = dict(cfg)
     if display.get("auth_headers"):
-        masked = []
-        for name, val in display["auth_headers"]:
-            if val.startswith("env:") or val.startswith("file:"):
-                masked.append([name, val])
-            else:
-                masked.append([name, val[:4] + "****" if len(val) > 4 else "****"])
-        display["auth_headers"] = masked
+        display["auth_headers"] = [
+            [name, _mask_secret(val)] for name, val in display["auth_headers"]
+        ]
+    for field in _SECRET_BAKE_FIELDS:
+        if display.get(field):
+            display[field] = _mask_secret(display[field])
     print(json.dumps(display, indent=2, ensure_ascii=False))
+
+
+_WRAPPER_MARKER = "# installed by mcp2cli bake install"
+
+
+def _wrapper_is_ours(path: Path) -> bool:
+    """True only for a wrapper script mcp2cli itself wrote.
+
+    A symlink is never ours: `bake install` writes a regular file, and reading
+    the marker through a link would answer for the link's target rather than
+    for the path we are about to unlink.
+    """
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        return _WRAPPER_MARKER in path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _remove_installed_wrapper(name: str, cfg: dict) -> None:
+    """Delete the wrapper for *name*, but only if mcp2cli installed it.
+
+    `bake install` records its destination as an absolute path, so a wrapper
+    placed by --dir is found again from any working directory. Anything we
+    cannot positively identify as ours is left alone and reported: deleting an
+    unrelated executable that merely shares the baked tool's name is far worse
+    than leaving a stale wrapper behind.
+    """
+    recorded = cfg.get("wrapper_path")
+    if recorded:
+        wrapper = Path(recorded)
+        if not wrapper.is_absolute():
+            # Recorded by a version that stored --dir verbatim: interpreting it
+            # against the current directory would point at a different file.
+            print(
+                f"Note: left the wrapper for '{name}' in place -- its recorded "
+                f"location {recorded!r} is relative to an unknown directory.",
+                file=sys.stderr,
+            )
+            return
+    else:
+        wrapper = Path.home() / ".local" / "bin" / name
+    if not wrapper.exists() and not wrapper.is_symlink():
+        return
+    if not _wrapper_is_ours(wrapper):
+        print(
+            f"Note: left {wrapper} in place -- it was not installed by "
+            f"mcp2cli bake install.",
+            file=sys.stderr,
+        )
+        return
+    try:
+        wrapper.unlink()
+    except OSError as exc:
+        print(f"Warning: could not remove {wrapper}: {exc}", file=sys.stderr)
+        return
+    print(f"Removed installed wrapper: {wrapper}")
 
 
 def _bake_remove(argv: list[str]) -> None:
@@ -2483,13 +2960,10 @@ def _bake_remove(argv: list[str]) -> None:
     if args.name not in all_configs:
         print(f"Error: no baked tool named '{args.name}'", file=sys.stderr)
         sys.exit(1)
+    cfg = all_configs[args.name]
     del all_configs[args.name]
     _save_baked_all(all_configs)
-    # Clean up any installed wrapper
-    wrapper = Path.home() / ".local" / "bin" / args.name
-    if wrapper.exists():
-        wrapper.unlink()
-        print(f"Removed installed wrapper: {wrapper}")
+    _remove_installed_wrapper(args.name, cfg)
     print(f"Baked tool '{args.name}' removed.")
 
 
@@ -2536,18 +3010,32 @@ def _bake_install(argv: list[str]) -> None:
     if cfg is None:
         print(f"Error: no baked tool named '{args.name}'", file=sys.stderr)
         sys.exit(1)
-    bin_dir = Path(args.dir) if args.dir else Path.home() / ".local" / "bin"
+    bin_dir = Path(args.dir).expanduser() if args.dir else Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
+    # Anchor the destination absolutely: a relative --dir like ./scripts means
+    # nothing to a later `bake remove` run from a different directory. Only the
+    # directory is resolved -- keeping the final component as-is means a
+    # symlink named after the tool is unlinked itself rather than removal
+    # following it into whatever unrelated file it points at.
+    bin_dir = bin_dir.resolve()
     wrapper = bin_dir / args.name
     # Resolve mcp2cli path
     mcp2cli_bin = shutil.which("mcp2cli") or "mcp2cli"
     wrapper.write_text(
-        f"#!/bin/sh\nexec {shlex.quote(mcp2cli_bin)} @{args.name} \"$@\"\n"
+        f"#!/bin/sh\n{_WRAPPER_MARKER}\n"
+        f"exec {shlex.quote(mcp2cli_bin)} @{args.name} \"$@\"\n"
     )
     wrapper.chmod(0o755)
+    # Remember where it landed so `bake remove` can find it again, including
+    # when --dir put it somewhere other than ~/.local/bin.
+    all_configs = _load_baked_all()
+    if args.name in all_configs:
+        all_configs[args.name]["wrapper_path"] = str(wrapper)
+        _save_baked_all(all_configs)
     print(f"Installed wrapper: {wrapper}")
-    if args.dir is None and str(bin_dir) not in os.environ.get("PATH", ""):
-        print(f"  Note: {bin_dir} may not be in your PATH")
+    default_dir = Path.home() / ".local" / "bin"
+    if args.dir is None and str(default_dir) not in os.environ.get("PATH", ""):
+        print(f"  Note: {default_dir} may not be in your PATH")
 
 
 # ---------------------------------------------------------------------------
@@ -2605,16 +3093,22 @@ def build_argparse(
                 "--stdin",
                 action="store_true",
                 default=False,
-                help="Read JSON body/arguments from stdin",
+                help="Read JSON body/arguments from stdin; parameter flags "
+                "are merged in (a conflicting value is an error)",
             )
 
+        cli_names = {p.cli_name or p.name for p in cmd.params}
         for p in cmd.params:
             flag = f"--{p.cli_name or p.name}"
             kwargs: dict = {}
             if p.python_type is not None:
                 kwargs["type"] = p.python_type
-            else:
+            elif f"no-{p.cli_name or p.name}" in cli_names:
+                # Another parameter already owns --no-<name>; keep the plain switch.
                 kwargs["action"] = "store_true"
+            else:
+                # --<name> sends true, --no-<name> sends false, omitted sends nothing.
+                kwargs["action"] = argparse.BooleanOptionalAction
             # Body/tool_input params are never argparse-required (--stdin bypasses them)
             if (
                 p.required
@@ -2739,6 +3233,47 @@ def _filter_commands(commands: list[CommandDef], pattern: str) -> list[CommandDe
 # ---------------------------------------------------------------------------
 
 
+def _serialize_openapi_path_param(value, param: ParamDef) -> str:
+    """Serialize flat path values, encoding data before adding style delimiters."""
+    value = coerce_value(value, param.schema)
+    style = param.style or "simple"
+
+    def encode(atom):
+        text = str(atom).lower() if isinstance(atom, bool) else str(atom)
+        # HTTP clients normalize literal dot segments before sending a request.
+        if text in (".", ".."):
+            return text.replace(".", "%2E")
+        return quote(text, safe="")
+
+    name = encode(param.original_name)
+    if isinstance(value, dict):
+        pairs = [(encode(k), encode(v)) for k, v in value.items() if v is not None]
+        if not pairs:
+            return ""
+        if param.explode:
+            parts = [f"{k}={v}" for k, v in pairs]
+            if style == "matrix":
+                return ";" + ";".join(parts)
+        else:
+            parts = [atom for pair in pairs for atom in pair]
+    elif isinstance(value, list):
+        parts = [encode(v) for v in value if v is not None]
+        if not parts:
+            return ""
+        if style == "matrix" and param.explode:
+            return "".join(f";{name}={part}" for part in parts)
+    else:
+        parts = [encode(value)]
+
+    separator = "." if style == "label" and param.explode else ","
+    serialized = separator.join(parts)
+    if style == "label":
+        return "." + serialized
+    if style == "matrix":
+        return f";{name}={serialized}" if serialized else f";{name}"
+    return serialized
+
+
 def _collect_openapi_params(
     cmd: CommandDef,
     args: argparse.Namespace,
@@ -2758,30 +3293,36 @@ def _collect_openapi_params(
         if p.location == "path":
             val = getattr(args, _param_dest(p), None)
             if val is not None:
-                path = path.replace(f"{{{p.original_name}}}", str(val))
+                path = path.replace(
+                    f"{{{p.original_name}}}", _serialize_openapi_path_param(val, p)
+                )
 
-    if cmd.method == "get":
-        for p in cmd.params:
-            val = getattr(args, _param_dest(p), None)
-            if val is None:
-                continue
-            if p.location == "query":
-                query_params[p.original_name] = coerce_value(val, p.schema)
-            elif p.location == "header":
-                extra_headers[p.original_name] = str(val)
-    else:
+    # Query and header values are transport metadata on every verb, so gather
+    # them once here -- including when --stdin supplies the body, which used to
+    # skip the header pass entirely and silently drop header parameters.
+    for p in cmd.params:
+        val = getattr(args, _param_dest(p), None)
+        if val is None:
+            continue
+        if p.location == "query":
+            query_params[p.original_name] = coerce_value(val, p.schema)
+        elif p.location == "header":
+            extra_headers[p.original_name] = str(val)
+
+    if cmd.method != "get":
         if getattr(args, "stdin", False) is True:
-            body = read_stdin_json("OpenAPI request body")
+            body = _merge_stdin_flag_args(
+                read_stdin_json("OpenAPI request body"), cmd, args, "OpenAPI request body"
+            )
         else:
             body = {}
             for p in cmd.params:
+                if p.location in ("path", "query", "header", "cookie"):
+                    # Path values travel in the URL, query and header values are
+                    # collected above, and a cookie parameter is not a body field
+                    # either. None of them belong in the JSON payload.
+                    continue
                 val = getattr(args, _param_dest(p), None)
-                if p.location == "header":
-                    if val is not None:
-                        extra_headers[p.original_name] = str(val)
-                    continue
-                if p.location == "path":
-                    continue
                 if p.location == "file":
                     if val is not None:
                         fp = Path(val)
@@ -2797,14 +3338,32 @@ def _collect_openapi_params(
                     body[p.original_name] = coerce_value(val, p.schema)
             if not body:
                 body = None
-        # Also collect query params for non-GET
-        for p in cmd.params:
-            if p.location == "query":
-                val = getattr(args, _param_dest(p), None)
-                if val is not None:
-                    query_params[p.original_name] = coerce_value(val, p.schema)
 
     return path, query_params, extra_headers, body, files
+
+
+def _serialize_openapi_query_params(cmd: CommandDef, query_params: dict) -> str:
+    """Encode query array atoms before joining their OpenAPI delimiters."""
+    parameters = {p.original_name: p for p in cmd.params if p.location == "query"}
+    parts = []
+    for name, value in query_params.items():
+        param = parameters[name]
+        separator = {"form": ",", "spaceDelimited": "%20", "pipeDelimited": "%7C"}.get(
+            param.style or "form"
+        )
+        if isinstance(value, list) and not param.explode and separator is not None:
+            if not value:
+                continue
+            atoms = [
+                quote(str(item).lower() if isinstance(item, bool) else str(item), safe="")
+                for item in value
+                if item is not None
+            ]
+            if atoms:
+                parts.append(f"{quote(name, safe='')}={separator.join(atoms)}")
+        else:
+            parts.append(str(httpx.QueryParams({name: value})))
+    return "&".join(part for part in parts if part)
 
 
 def execute_openapi(
@@ -2821,6 +3380,14 @@ def execute_openapi(
 ):
     path, query_params, extra_headers, body, files = _collect_openapi_params(cmd, args)
     url = base_url.rstrip("/") + path
+    if query_params:
+        # Append to, rather than replace, any query string the spec path or
+        # base URL already carries (e.g. `/search?type=user`).
+        parsed = httpx.URL(url)
+        query = _serialize_openapi_query_params(cmd, query_params).encode("ascii")
+        if parsed.query:
+            query = parsed.query + b"&" + query
+        url = parsed.copy_with(query=query)
 
     is_multipart = files is not None or cmd.content_type == "multipart/form-data"
     headers = _build_http_headers(auth_headers, multipart=is_multipart)
@@ -2833,7 +3400,6 @@ def execute_openapi(
                     (cmd.method or "get").upper(),
                     url,
                     headers=headers,
-                    params=query_params or None,
                     data=body,
                     files=files,
                 )
@@ -2842,7 +3408,6 @@ def execute_openapi(
                     (cmd.method or "get").upper(),
                     url,
                     headers=headers,
-                    params=query_params or None,
                     data=body,
                 )
             else:
@@ -2850,7 +3415,6 @@ def execute_openapi(
                     (cmd.method or "get").upper(),
                     url,
                     headers=headers,
-                    params=query_params or None,
                     json=body,
                 )
             _handle_http_error(resp)
@@ -2902,6 +3466,29 @@ def _exc_message(exc: BaseException) -> str:
     return "; ".join(part for part in parts if part) or exc.__class__.__name__
 
 
+def _is_disconnect(exc: BaseException) -> bool:
+    """Report whether a leaf exception means the server dropped the connection."""
+    if isinstance(
+        exc,
+        (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            anyio.EndOfStream,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ),
+    ):
+        return True
+    try:  # MCP SDK v2
+        from mcp.shared.exceptions import MCPError
+        from mcp_types import CONNECTION_CLOSED
+    except ImportError:  # MCP SDK v1
+        from mcp.shared.exceptions import McpError as MCPError
+        from mcp.types import CONNECTION_CLOSED
+    return isinstance(exc, MCPError) and exc.error.code == CONNECTION_CLOSED
+
+
 def _run_mcp_clean(fn, source: str):
     """Run an MCP coroutine, reporting failures as one clean error line.
 
@@ -2927,6 +3514,11 @@ def _run_mcp_clean(fn, source: str):
             hint = (
                 " — the server rejected the request; pass credentials with "
                 "--auth-header 'Name:Value' or use the --oauth-* options"
+            )
+        elif any(_is_disconnect(leaf) for leaf in leaves):
+            hint = (
+                " — the server disconnected unexpectedly; it may have crashed "
+                "or exited. Check the server command and its logs"
             )
         else:
             hint = ""
@@ -3133,7 +3725,7 @@ def run_mcp_stdio(
         from mcp import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
-        parts = shlex.split(command_str)
+        parts = split_shell_command(command_str)
         env = {**os.environ, **env_vars}
         params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
 
@@ -3542,28 +4134,25 @@ def session_start(
 
     # Spawn daemon.
     #
-    # auth_headers/env_vars are credential material, so they must NOT be
-    # embedded in the child's argv (any local user can read that via
-    # `ps auxww` or /proc/<pid>/cmdline). Instead the config is written to a
-    # private 0o600 file and only its PATH is passed on the command line; the
-    # daemon reads the file and unlinks it immediately (see
-    # _run_session_daemon).
-    config_path = SESSIONS_DIR / f"{name}.config.json"
-    _write_private(
-        config_path,
-        json.dumps(
-            {
-                "name": name,
-                "source": source,
-                "is_stdio": is_stdio,
-                "auth_headers": auth_headers,
-                "env_vars": env_vars,
-                "transport": transport,
-                "roots": list(roots or []),
-            }
-        ),
+    # auth_headers/env_vars are credential material, so they never reach the
+    # child's argv (readable via `ps auxww` or /proc/<pid>/cmdline) or disk:
+    # the config travels over the child's stdin (upstream v3.8.0).
+    daemon_config = json.dumps(
+        {
+            "name": name,
+            "source": source,
+            "is_stdio": is_stdio,
+            "auth_headers": auth_headers,
+            "env_vars": env_vars,
+            "transport": transport,
+            "roots": list(roots or []),
+        }
     )
 
+    # Route both streams to the session log rather than /dev/null: sandboxes
+    # that deny opening /dev/null would otherwise fail the spawn. The log is
+    # created and forced 0o600 (fork control) because daemon output can echo
+    # server URLs or error text that carries credential material.
     log_path = _session_log_path(name)
     log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -3577,17 +4166,27 @@ def session_start(
             [
                 sys.executable,
                 "-c",
-                f"import mcp2cli; mcp2cli._run_session_daemon({json.dumps(str(config_path))})",
+                (
+                    "import sys; config = sys.stdin.read(); "
+                    "import mcp2cli; mcp2cli._run_session_daemon(config)"
+                ),
             ],
             start_new_session=True,
-            stdout=subprocess.DEVNULL,
+            stdout=log_handle,
             stderr=log_handle,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
         )
     finally:
         # The child inherits its own copy of the fd; the parent no longer
         # needs the handle open regardless of whether Popen succeeded.
         log_handle.close()
+    # Read before importing mcp2cli so a large config cannot block our write
+    # during slow imports, before the startup timeout below takes effect.
+    # Closing the pipe completes the daemon's read and releases our descriptor.
+    if proc.stdin is not None:
+        # An early exit can break either write or close; report it below.
+        with suppress(BrokenPipeError), proc.stdin:
+            proc.stdin.write(daemon_config.encode("utf-8"))
 
     # Wait for socket to appear
     sock_path = _session_sock_path(name)
@@ -3597,9 +4196,6 @@ def session_start(
             print(f"Session '{name}' started (PID {proc.pid})")
             return
         if proc.poll() is not None:
-            # Daemon died before reading its config; remove the secret file
-            # so it does not linger on disk.
-            config_path.unlink(missing_ok=True)
             print(
                 f"Error: session daemon exited with code {proc.returncode}",
                 file=sys.stderr,
@@ -3607,7 +4203,6 @@ def session_start(
             sys.exit(1)
         time.sleep(0.1)
 
-    config_path.unlink(missing_ok=True)
     print("Error: session daemon did not start in time", file=sys.stderr)
     proc.kill()
     sys.exit(1)
@@ -3745,21 +4340,13 @@ _SESSION_DISPATCH = {
 }
 
 
-def _run_session_daemon(config_path: str):
+def _run_session_daemon(config_json: str):
     """Entry point for the session daemon process.
 
-    *config_path* is the path to a private ``0o600`` JSON file written by
-    :func:`session_start`. The credential payload (auth headers, env vars) is
-    passed by path -- never inline in argv -- so it is not exposed via
-    ``ps``/``/proc/<pid>/cmdline``. The file is read and then unlinked
-    immediately so the secrets do not linger on disk.
+    *config_json* arrives on the daemon's stdin from :func:`session_start`,
+    so the credential payload (auth headers, env vars) is never in argv
+    (``ps``/``/proc/<pid>/cmdline``) and never on disk.
     """
-    _config_file = Path(config_path)
-    config_json = _config_file.read_text()
-    try:
-        _config_file.unlink()
-    except FileNotFoundError:
-        pass
     config = json.loads(config_json)
     name = config["name"]
     source = config["source"]
@@ -3889,7 +4476,7 @@ def _run_session_daemon(config_path: str):
         if is_stdio:
             from mcp.client.stdio import StdioServerParameters, stdio_client
 
-            parts = shlex.split(source)
+            parts = split_shell_command(source)
             env = {**os.environ, **env_vars}
             params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
             async with stdio_client(params) as (read, write):
@@ -4145,7 +4732,9 @@ def handle_mcp(
     cmd: CommandDef = args._cmd
 
     if getattr(args, "stdin", False) is True:
-        arguments = read_stdin_json("MCP tool arguments")
+        arguments = _merge_stdin_flag_args(
+            read_stdin_json("MCP tool arguments"), cmd, args, "MCP tool arguments"
+        )
     else:
         arguments = {}
         for p in cmd.params:
@@ -4192,7 +4781,7 @@ def _fetch_mcp_tools(
             from mcp import ClientSession
             from mcp.client.stdio import StdioServerParameters, stdio_client
 
-            parts = shlex.split(source)
+            parts = split_shell_command(source)
             env = {**os.environ, **env_vars}
             params = StdioServerParameters(command=parts[0], args=parts[1:], env=env)
             async with stdio_client(params) as (read, write):
@@ -4769,7 +5358,10 @@ def _handle_session_operations(
 
     cmd: CommandDef = args._cmd
     if getattr(args, "stdin", False) is True:
-        arguments = read_stdin_json(f"session {sess_name} tool arguments")
+        arguments = _merge_stdin_flag_args(
+            read_stdin_json(f"session {sess_name} tool arguments"),
+            cmd, args, f"session {sess_name} tool arguments",
+        )
     else:
         arguments = {}
         for p in cmd.params:

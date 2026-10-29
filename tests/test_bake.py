@@ -247,14 +247,21 @@ class TestBakedToArgv:
 # ---------------------------------------------------------------------------
 
 
-def _run(*args, config_dir=None, cache_dir=None):
+def _run(*args, config_dir=None, cache_dir=None, cwd=None):
     env = os.environ.copy()
     if config_dir:
         env["MCP2CLI_CONFIG_DIR"] = str(config_dir)
     if cache_dir:
         env["MCP2CLI_CACHE_DIR"] = str(cache_dir)
     cmd = [sys.executable, "-m", "mcp2cli", *args]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        cwd=str(cwd) if cwd else None,
+    )
 
 
 class TestBakeCreateAndUse:
@@ -549,3 +556,333 @@ class TestBakeInstall:
         )
         assert r.returncode == 0
         assert "may not be in your PATH" not in r.stdout
+
+
+class TestBakeShowMasking:
+    """`bake show` output must be safe to paste, without changing what runs."""
+
+    def _create(self, cfg_dir, cache_dir, name, *extra):
+        r = _run(
+            "bake", "create", name,
+            "--spec", "https://api.example.com/openapi.json",
+            *extra,
+            config_dir=cfg_dir, cache_dir=cache_dir,
+        )
+        assert r.returncode == 0, r.stderr
+
+    def _show(self, cfg_dir, cache_dir, name):
+        r = _run("bake", "show", name, config_dir=cfg_dir, cache_dir=cache_dir)
+        assert r.returncode == 0, r.stderr
+        return r, json.loads(r.stdout)
+
+    @staticmethod
+    def _assert_redacted(shown, secret, output):
+        # The secret must never reach a terminal, and whatever hint is left
+        # behind may be no more than a short prefix of it.
+        assert secret not in output
+        visible = shown.rstrip("*")
+        assert len(visible) <= 4, shown
+        assert secret.startswith(visible), shown
+
+    def test_oauth_client_secret_is_redacted(self, tmp_path):
+        cfg_dir, cache_dir = tmp_path / "config", tmp_path / "cache"
+        secret = "sk-super-secret-value"
+        self._create(
+            cfg_dir, cache_dir, "mask-lit",
+            "--oauth-client-id", "my-client-id",
+            "--oauth-client-secret", secret,
+        )
+        r, cfg = self._show(cfg_dir, cache_dir, "mask-lit")
+        self._assert_redacted(cfg["oauth_client_secret"], secret, r.stdout + r.stderr)
+        # The client id is not a secret and stays diagnosable.
+        assert cfg["oauth_client_id"] == "my-client-id"
+
+    def test_secret_shorter_than_the_hint_is_not_disclosed(self, tmp_path):
+        cfg_dir, cache_dir = tmp_path / "config", tmp_path / "cache"
+        self._create(
+            cfg_dir, cache_dir, "mask-short",
+            "--oauth-client-id", "my-client-id",
+            "--oauth-client-secret", "abcd",
+        )
+        r, cfg = self._show(cfg_dir, cache_dir, "mask-short")
+        assert "abcd" not in r.stdout + r.stderr
+        assert cfg["oauth_client_secret"].strip("*") == ""
+
+    def test_auth_header_value_is_redacted(self, tmp_path):
+        cfg_dir, cache_dir = tmp_path / "config", tmp_path / "cache"
+        token = "Bearer tok-abcdef123456"
+        self._create(cfg_dir, cache_dir, "mask-hdr", "--auth-header", f"Authorization:{token}")
+        r, cfg = self._show(cfg_dir, cache_dir, "mask-hdr")
+        (header_name, shown), = cfg["auth_headers"]
+        # Header names are not secrets — you need them to diagnose auth.
+        assert header_name == "Authorization"
+        self._assert_redacted(shown, token, r.stdout + r.stderr)
+
+    @pytest.mark.parametrize("ref", ["env:OAUTH_SECRET", "file:/run/secrets/oauth"])
+    def test_indirect_references_stay_readable(self, tmp_path, ref):
+        cfg_dir, cache_dir = tmp_path / "config", tmp_path / "cache"
+        self._create(
+            cfg_dir, cache_dir, "mask-ref",
+            "--oauth-client-secret", ref,
+            "--auth-header", f"X-Key:{ref}",
+        )
+        _, cfg = self._show(cfg_dir, cache_dir, "mask-ref")
+        assert cfg["oauth_client_secret"] == ref
+        assert cfg["auth_headers"] == [["X-Key", ref]]
+
+    def test_masking_does_not_change_what_the_baked_tool_sends(self, tmp_path, monkeypatch):
+        import mcp2cli
+
+        cfg_dir, cache_dir = tmp_path / "config", tmp_path / "cache"
+        secret, token = "sk-super-secret-value", "Bearer tok-abcdef123456"
+        self._create(
+            cfg_dir, cache_dir, "mask-run",
+            "--oauth-client-id", "my-client-id",
+            "--oauth-client-secret", secret,
+            "--auth-header", f"Authorization:{token}",
+        )
+        self._show(cfg_dir, cache_dir, "mask-run")
+
+        # What `mcp2cli @mask-run ...` would run with: the real credentials.
+        monkeypatch.setattr(mcp2cli, "BAKED_FILE", cfg_dir / "baked.json")
+        argv = _baked_to_argv(_load_baked("mask-run"))
+        assert secret in argv
+        assert f"Authorization:{token}" in argv
+
+
+class TestBakeRemoveWrapperSafety:
+    """`bake remove` must only delete wrappers mcp2cli itself installed."""
+
+    def _baked(self, monkeypatch, tmp_path, name, extra=None):
+        import mcp2cli
+        cfg_dir = tmp_path / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(mcp2cli, "CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr(mcp2cli, "BAKED_FILE", cfg_dir / "baked.json")
+        config = {"source_type": "mcp", "source": "https://example.com/mcp"}
+        config.update(extra or {})
+        mcp2cli._save_baked_all({name: config})
+        return mcp2cli
+
+    def test_foreign_file_with_the_same_name_is_left_alone(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        victim = home / ".local" / "bin" / "jq"
+        victim.write_text("#!/bin/sh\n# the user's own jq\n")
+
+        m = self._baked(monkeypatch, tmp_path, "jq")
+        m._bake_remove(["jq"])
+
+        assert victim.exists()
+        assert "the user's own jq" in victim.read_text()
+        assert m._load_baked("jq") is None
+
+    def test_wrapper_we_installed_is_removed(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        m = self._baked(monkeypatch, tmp_path, "mytool")
+        m._bake_install(["mytool"])
+        wrapper = home / ".local" / "bin" / "mytool"
+        assert wrapper.exists()
+
+        m._bake_remove(["mytool"])
+        assert not wrapper.exists()
+
+    def test_wrapper_installed_with_custom_dir_is_removed(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        custom = tmp_path / "scripts"
+        m = self._baked(monkeypatch, tmp_path, "mytool")
+        m._bake_install(["mytool", "--dir", str(custom)])
+        wrapper = custom / "mytool"
+        assert wrapper.exists()
+
+        m._bake_remove(["mytool"])
+        assert not wrapper.exists()
+
+    def test_custom_dir_install_does_not_touch_default_dir(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        # An unrelated binary sits at the default location under the same name.
+        decoy = home / ".local" / "bin" / "mytool"
+        decoy.write_text("#!/bin/sh\n# unrelated\n")
+
+        custom = tmp_path / "scripts"
+        m = self._baked(monkeypatch, tmp_path, "mytool")
+        m._bake_install(["mytool", "--dir", str(custom)])
+        m._bake_remove(["mytool"])
+
+        assert not (custom / "mytool").exists()
+        assert decoy.exists()
+
+    def test_relative_dir_wrapper_is_removed_from_a_different_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        project = tmp_path / "project"
+        elsewhere = tmp_path / "elsewhere"
+        (project / "scripts").mkdir(parents=True)
+        (elsewhere / "scripts").mkdir(parents=True)
+
+        m = self._baked(monkeypatch, tmp_path, "mytool")
+        monkeypatch.chdir(project)
+        m._bake_install(["mytool", "--dir", "./scripts"])
+        installed = project / "scripts" / "mytool"
+        assert installed.exists()
+
+        # A byte-identical wrapper of the same name sits at the same *relative*
+        # path below the directory `bake remove` runs from; only the recorded
+        # absolute destination tells the two apart.
+        decoy = elsewhere / "scripts" / "mytool"
+        decoy.write_text(installed.read_text())
+
+        monkeypatch.chdir(elsewhere)
+        m._bake_remove(["mytool"])
+
+        assert not installed.exists()
+        assert decoy.exists()
+
+    def test_wrapper_in_a_symlinked_dir_is_removed_without_touching_neighbours(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        real = tmp_path / "real_bin"
+        real.mkdir()
+        neighbour = real / "othertool"
+        neighbour.write_text("#!/bin/sh\n# the user's own othertool\n")
+        link = tmp_path / "link_bin"
+        link.symlink_to(real)
+
+        m = self._baked(monkeypatch, tmp_path, "mytool")
+        m._bake_install(["mytool", "--dir", str(link)])
+        assert (real / "mytool").exists()
+
+        m._bake_remove(["mytool"])
+
+        assert not (real / "mytool").exists()
+        assert neighbour.exists()
+
+    def test_symlink_squatting_the_recorded_path_is_not_followed(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        custom = tmp_path / "scripts"
+        m = self._baked(monkeypatch, tmp_path, "mytool")
+        m._bake_install(["mytool", "--dir", str(custom)])
+        wrapper = custom / "mytool"
+
+        # Something replaced our file with a link to an unrelated wrapper.
+        target = tmp_path / "other-wrapper"
+        target.write_text(
+            f"#!/bin/sh\n{m._WRAPPER_MARKER}\nexec mcp2cli @othertool \"$@\"\n"
+        )
+        wrapper.unlink()
+        wrapper.symlink_to(target)
+
+        m._bake_remove(["mytool"])
+
+        assert target.exists()
+
+    def test_legacy_relative_recorded_path_is_left_alone(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        import mcp2cli
+
+        project = tmp_path / "project"
+        (project / "scripts").mkdir(parents=True)
+        bystander = project / "scripts" / "mytool"
+        bystander.write_text(f"#!/bin/sh\n{mcp2cli._WRAPPER_MARKER}\n")
+
+        # An older version stored --dir verbatim; the directory it was relative
+        # to is unknowable, so nothing below the current one may be deleted.
+        m = self._baked(
+            monkeypatch, tmp_path, "mytool", extra={"wrapper_path": "scripts/mytool"}
+        )
+        monkeypatch.chdir(project)
+        m._bake_remove(["mytool"])
+
+        assert bystander.exists()
+        assert m._load_baked("mytool") is None
+
+    def test_remove_succeeds_when_no_wrapper_was_installed(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        m = self._baked(monkeypatch, tmp_path, "mytool")
+        m._bake_remove(["mytool"])
+        assert m._load_baked("mytool") is None
+
+
+class TestBakeRemoveAcrossWorkingDirectories:
+    """End-to-end: `--dir ./scripts` in one directory, `remove` from another."""
+
+    def test_relative_install_dir_survives_a_change_of_directory(self, tmp_path):
+        cfg_dir = tmp_path / "config"
+        cache_dir = tmp_path / "cache"
+        project = tmp_path / "project"
+        elsewhere = tmp_path / "elsewhere"
+        project.mkdir()
+        (elsewhere / "scripts").mkdir(parents=True)
+
+        r = _run(
+            "bake", "create", "reltool",
+            "--mcp-stdio", f"{sys.executable} {MCP_SERVER}",
+            config_dir=cfg_dir, cache_dir=cache_dir,
+        )
+        assert r.returncode == 0, r.stderr
+
+        r = _run(
+            "bake", "install", "reltool", "--dir", "./scripts",
+            config_dir=cfg_dir, cache_dir=cache_dir, cwd=project,
+        )
+        assert r.returncode == 0, r.stderr
+        installed = project / "scripts" / "reltool"
+        assert installed.exists()
+
+        decoy = elsewhere / "scripts" / "reltool"
+        decoy.write_text(installed.read_text())
+
+        r = _run(
+            "bake", "remove", "reltool",
+            config_dir=cfg_dir, cache_dir=cache_dir, cwd=elsewhere,
+        )
+        assert r.returncode == 0, r.stderr
+        assert not installed.exists(), "the wrapper we installed was not removed"
+        assert decoy.exists(), "a same-named file below the new cwd was deleted"

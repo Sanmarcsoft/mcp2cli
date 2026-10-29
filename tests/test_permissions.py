@@ -13,6 +13,7 @@ Covers the security patch on branch ``security/credential-permission-hardening``
 - ``resolve_secret`` warns (but does not change behaviour) on literal values.
 """
 
+import io
 import json
 import os
 import stat
@@ -155,7 +156,7 @@ class TestUmaskIndependence:
 
 
 class TestSessionDaemonSecretExposure:
-    def test_daemon_argv_has_no_secret_and_config_is_private(
+    def test_daemon_secret_travels_on_stdin_never_argv_or_disk(
         self, tmp_path, monkeypatch
     ):
         sessions = tmp_path / "sessions"
@@ -164,9 +165,17 @@ class TestSessionDaemonSecretExposure:
         sentinel = "s3ntinel-secret-token-DO-NOT-LEAK"
         captured = {}
 
+        class FakeStdin(io.BytesIO):
+            def close(self):
+                captured["stdin"] = self.getvalue()
+                super().close()
+
         class FakeProc:
             pid = 4321
             returncode = 0
+
+            def __init__(self):
+                self.stdin = FakeStdin()
 
             def poll(self):
                 return None
@@ -176,10 +185,9 @@ class TestSessionDaemonSecretExposure:
 
         def fake_popen(argv, **kwargs):
             captured["argv"] = list(argv)
-            # Release the stderr log handle the parent opened for the child.
-            err = kwargs.get("stderr")
-            if hasattr(err, "close"):
-                err.close()
+            captured["stdin_kw"] = kwargs.get("stdin")
+            # Record the log's mode while the parent still holds it open.
+            captured["log_mode"] = _mode(mcp2cli._session_log_path("mysess"))
             # Pretend the daemon came up by creating its socket file so
             # session_start's readiness loop returns instead of timing out.
             sock = mcp2cli._session_sock_path("mysess")
@@ -197,28 +205,25 @@ class TestSessionDaemonSecretExposure:
             {"API_KEY": sentinel},
         )
 
-        # Session dir is locked down.
+        # Session dir and daemon log are locked down (fork controls).
         assert _mode(sessions) == 0o700
+        assert captured["log_mode"] == 0o600
 
         # The ps-visible argv must not carry the secret anywhere.
-        joined = " ".join(captured["argv"])
-        assert sentinel not in joined
+        assert sentinel not in " ".join(captured["argv"])
 
-        # The secret lives only in a private 0o600 file referenced by path.
-        config_path = sessions / "mysess.config.json"
-        assert config_path.exists()
-        assert _mode(config_path) == 0o600
-        assert sentinel in config_path.read_text()
-        assert str(config_path) in joined
+        # The secret reaches the daemon over stdin only, never on disk.
+        assert captured["stdin_kw"] is mcp2cli.subprocess.PIPE
+        assert sentinel in captured["stdin"].decode("utf-8")
+        for f in sessions.iterdir():
+            if f.is_file():
+                assert sentinel not in f.read_text(errors="replace"), f
 
-    def test_run_session_daemon_reads_and_unlinks_config(
-        self, tmp_path, monkeypatch
-    ):
+    def test_run_session_daemon_takes_config_json(self, tmp_path, monkeypatch):
         sessions = tmp_path / "sessions"
         sessions.mkdir()
         monkeypatch.setattr(mcp2cli, "SESSIONS_DIR", sessions)
 
-        config_path = sessions / "d.config.json"
         payload = {
             "name": "d",
             "source": "https://example.com/mcp",
@@ -227,7 +232,6 @@ class TestSessionDaemonSecretExposure:
             "env_vars": {},
             "transport": "auto",
         }
-        mcp2cli._write_private(config_path, json.dumps(payload))
 
         ran = {}
 
@@ -239,11 +243,11 @@ class TestSessionDaemonSecretExposure:
 
         monkeypatch.setattr(anyio, "run", fake_run)
 
-        mcp2cli._run_session_daemon(str(config_path))
+        mcp2cli._run_session_daemon(json.dumps(payload))
 
         assert ran.get("called") is True
-        # Config file is unlinked immediately after being read.
-        assert not config_path.exists()
+        # Nothing credential-bearing was written to the sessions dir.
+        assert not any(p.name.endswith(".config.json") for p in sessions.iterdir())
 
 
 class TestResolveSecretWarning:
@@ -347,6 +351,7 @@ class TestSecurityGateHardening:
         class FakeProc:
             pid = 5678
             returncode = 0
+            stdin = None  # config delivery is covered by the stdin tests
 
             def poll(self):
                 return None
@@ -381,7 +386,7 @@ class TestSecurityGateHardening:
                 mode & 0o077 == 0
             ), f"Path {p} has unsafe permissions: {oct(mode)} (group/other accessible)"
 
-    def test_session_start_passes_roots_via_private_config_not_argv(
+    def test_session_start_passes_roots_via_stdin_not_argv_or_disk(
         self, tmp_path, monkeypatch, permissive_umask
     ):
         _isolate_paths(tmp_path, monkeypatch)
@@ -390,9 +395,17 @@ class TestSecurityGateHardening:
         env_secret = "secret-env-var-val"
         captured = {}
 
+        class FakeStdin(io.BytesIO):
+            def close(self):
+                captured["stdin"] = self.getvalue()
+                super().close()
+
         class FakeProc:
             pid = 9999
             returncode = 0
+
+            def __init__(self):
+                self.stdin = FakeStdin()
 
             def poll(self):
                 return None
@@ -424,11 +437,10 @@ class TestSecurityGateHardening:
         assert auth_secret not in joined_argv
         assert env_secret not in joined_argv
 
-        config_path = mcp2cli.SESSIONS_DIR / "sess_test.config.json"
-        assert config_path.exists()
-        assert _mode(config_path) == 0o600
-        config_data = json.loads(config_path.read_text())
+        assert not (mcp2cli.SESSIONS_DIR / "sess_test.config.json").exists()
+        config_data = json.loads(captured["stdin"].decode("utf-8"))
         assert config_data["roots"] == ["file:///tmp/project-a"]
+        assert config_data["auth_headers"] == [["Authorization", f"Bearer {auth_secret}"]]
 
         log_path = mcp2cli._session_log_path("sess_test")
         assert log_path.exists()

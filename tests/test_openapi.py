@@ -4,6 +4,9 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -190,6 +193,32 @@ class TestExecuteOpenAPI:
         assert r.returncode == 0
         data = json.loads(r.stdout)
         assert data["name"] == "Snowball"
+
+    def test_create_pet_stdin_merges_body_flags(self, petstore_server):
+        cmd = [
+            sys.executable,
+            "-m",
+            "mcp2cli",
+            "--spec",
+            f"{petstore_server}/openapi.json",
+            "--base-url",
+            f"{petstore_server}/api/v1",
+            "create-pet",
+            "--tag",
+            "rabbit",
+            "--stdin",
+        ]
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            input='{"name": "Snowball"}',
+            timeout=15,
+        )
+        assert r.returncode == 0, r.stderr
+        data = json.loads(r.stdout)
+        assert data["name"] == "Snowball"
+        assert data["tag"] == "rabbit"
 
     def test_create_pet_stdin_invalid_json(self, petstore_server):
         cmd = [
@@ -483,3 +512,444 @@ class TestCollectMultipartParams:
         _, _, _, body, files = _collect_openapi_params(cmd, args)
         assert files is None
         assert body == {"caption": "hello"}
+
+
+def _path_level_param_spec():
+    """A path item that declares its parameters once, for every operation."""
+    return {
+        "openapi": "3.0.0",
+        "paths": {
+            "/users/{userId}": {
+                "parameters": [
+                    {
+                        "name": "userId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "verbose",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                    },
+                ],
+                "get": {"operationId": "getUser", "responses": {}},
+                "delete": {"operationId": "deleteUser", "responses": {}},
+            }
+        },
+    }
+
+
+def _mixed_location_spec(method="post"):
+    """An operation carrying query, header, path and body parameters at once."""
+    return {
+        "openapi": "3.0.0",
+        "paths": {
+            "/tenants/{tenantId}/items": {
+                method: {
+                    "operationId": "createItem",
+                    "parameters": [
+                        {"name": "tenantId", "in": "path", "required": True,
+                         "schema": {"type": "string"}},
+                        {"name": "dryRun", "in": "query",
+                         "schema": {"type": "string"}},
+                        {"name": "region", "in": "query",
+                         "schema": {"type": "string"}},
+                        {"name": "X-Trace", "in": "header",
+                         "schema": {"type": "string"}},
+                    ],
+                    "requestBody": {"content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "qty": {"type": "integer"},
+                        },
+                    }}}},
+                    "responses": {},
+                }
+            }
+        },
+    }
+
+
+class TestPathLevelParameters:
+    """OpenAPI 3.x: `parameters` on a path item apply to every operation."""
+
+    def test_inherited_by_every_operation(self):
+        cmds = extract_openapi_commands(_path_level_param_spec())
+        by_name = {c.name: c for c in cmds}
+        assert set(by_name) == {"get-user", "delete-user"}
+        for cmd in by_name.values():
+            locations = {p.original_name: p.location for p in cmd.params}
+            assert locations == {"userId": "path", "verbose": "query"}
+
+    def test_path_placeholder_is_substituted(self):
+        cmd = extract_openapi_commands(_path_level_param_spec())[0]
+        args = argparse.Namespace(user_id="u-42", verbose=None, stdin=False)
+        path, query, headers, body, files = _collect_openapi_params(cmd, args)
+        assert path == "/users/u-42"
+
+    def test_operation_level_overrides_inherited(self):
+        spec = _path_level_param_spec()
+        spec["paths"]["/users/{userId}"]["get"]["parameters"] = [
+            {
+                "name": "userId",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "integer"},
+            }
+        ]
+        cmds = {c.name: c for c in extract_openapi_commands(spec)}
+        get_param = next(
+            p for p in cmds["get-user"].params if p.original_name == "userId"
+        )
+        # The operation's narrower declaration wins...
+        assert get_param.python_type is int
+        # ...while the sibling operation keeps the inherited one.
+        del_param = next(
+            p for p in cmds["delete-user"].params if p.original_name == "userId"
+        )
+        assert del_param.python_type is str
+        # An override must not drop the other inherited parameters.
+        assert {p.original_name for p in cmds["get-user"].params} == {
+            "userId",
+            "verbose",
+        }
+
+    def test_operation_level_only_still_works(self):
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "parameters": [
+                            {"name": "limit", "in": "query",
+                             "schema": {"type": "integer"}}
+                        ],
+                        "responses": {},
+                    }
+                }
+            },
+        }
+        cmd = extract_openapi_commands(spec)[0]
+        assert [p.original_name for p in cmd.params] == ["limit"]
+
+    def test_malformed_parameter_entries_are_skipped(self):
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/x": {
+                    "parameters": ["not-a-dict", {"no_name": True}],
+                    "get": {"operationId": "getX", "responses": {}},
+                }
+            },
+        }
+        cmd = extract_openapi_commands(spec)[0]
+        assert cmd.params == []
+def _collision_spec(*entries):
+    """Build a spec from (path, method, operationId) triples."""
+    paths: dict = {}
+    for path, method, op_id in entries:
+        op: dict = {"responses": {}}
+        if op_id is not None:
+            op["operationId"] = op_id
+        paths.setdefault(path, {})[method] = op
+    return {"openapi": "3.0.0", "paths": paths}
+
+
+class TestCommandNameCollisions:
+    """Colliding OpenAPI command names must stay unique and addressable."""
+
+    def test_three_way_collision_stays_unique(self):
+        spec = _collision_spec(
+            ("/a", "post", "doThing"),
+            ("/b", "post", "doThing"),
+            ("/c", "post", "doThing"),
+        )
+        names = [c.name for c in extract_openapi_commands(spec)]
+        assert len(names) == len(set(names))
+        assert names == ["do-thing", "do-thing-post", "do-thing-post-2"]
+
+    def test_three_way_collision_builds_a_parser(self):
+        spec = _collision_spec(
+            ("/a", "post", "doThing"),
+            ("/b", "post", "doThing"),
+            ("/c", "post", "doThing"),
+        )
+        cmds = extract_openapi_commands(spec)
+        parser = build_argparse(cmds, argparse.ArgumentParser(add_help=False))
+        for cmd in cmds:
+            args = parser.parse_args([cmd.name])
+            assert args._cmd is cmd
+
+    def test_method_suffix_used_when_free(self):
+        spec = _collision_spec(
+            ("/a", "get", "doThing"),
+            ("/b", "post", "doThing"),
+        )
+        assert [c.name for c in extract_openapi_commands(spec)] == [
+            "do-thing",
+            "do-thing-post",
+        ]
+
+    def test_alias_never_shadows_another_natural_name(self):
+        spec = _collision_spec(
+            ("/a", "post", "doThing"),
+            ("/b", "post", "doThing"),
+            ("/c", "post", "doThingPost"),
+        )
+        cmds = extract_openapi_commands(spec)
+        names = [c.name for c in cmds]
+        assert len(names) == len(set(names))
+        by_op = {c.path: c.name for c in cmds}
+        assert by_op["/c"] == "do-thing-post"
+        assert by_op["/b"] == "do-thing-post-2"
+
+    def test_pathless_slug_names_still_unique(self):
+        spec = _collision_spec(
+            ("/items", "get", None),
+            ("/items", "post", None),
+        )
+        names = [c.name for c in extract_openapi_commands(spec)]
+        assert names == ["get-items", "post-items"]
+
+    def test_no_collision_leaves_names_untouched(self):
+        spec = _collision_spec(
+            ("/a", "get", "listThings"),
+            ("/b", "post", "createThing"),
+        )
+        assert [c.name for c in extract_openapi_commands(spec)] == [
+            "list-things",
+            "create-thing",
+        ]
+
+    def test_distinct_operation_ids_that_kebab_alike_stay_addressable(self):
+        # A perfectly valid spec: four different operationIds that all
+        # normalize to the same CLI name. Every operation must keep its own
+        # command, and that command must carry its own path and method.
+        spec = _collision_spec(
+            ("/pets", "get", "listPets"),
+            ("/pets", "post", "list-pets"),
+            ("/pets/all", "get", "list_pets"),
+            ("/pets/legacy", "get", "ListPets"),
+        )
+        cmds = extract_openapi_commands(spec)
+        wire = {c.name: (c.method, c.path) for c in cmds}
+        assert wire == {
+            "list-pets": ("get", "/pets"),
+            "list-pets-post": ("post", "/pets"),
+            "list-pets-get": ("get", "/pets/all"),
+            "list-pets-get-2": ("get", "/pets/legacy"),
+        }
+        parser = build_argparse(cmds, argparse.ArgumentParser(add_help=False))
+        for cmd in cmds:
+            assert parser.parse_args([cmd.name])._cmd is cmd
+
+
+class TestQueryParamsStayOutOfBody:
+    """Query, header and path values travel outside the JSON body."""
+
+    @pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+    def test_query_param_not_copied_into_json_body(self, method):
+        cmd = extract_openapi_commands(_mixed_location_spec(method))[0]
+        args = argparse.Namespace(
+            tenant_id="acme", dry_run=None, region="eu", x_trace=None,
+            name="widget", qty=3, stdin=False,
+        )
+        path, query, headers, body, files = _collect_openapi_params(cmd, args)
+        assert body == {"name": "widget", "qty": 3}
+        assert query == {"region": "eu"}
+        assert path == "/tenants/acme/items"
+
+    def test_header_and_path_still_excluded_from_body(self):
+        cmd = extract_openapi_commands(_mixed_location_spec())[0]
+        args = argparse.Namespace(
+            tenant_id="acme", dry_run="yes", region=None, x_trace="abc123",
+            name="widget", qty=None, stdin=False,
+        )
+        path, query, headers, body, files = _collect_openapi_params(cmd, args)
+        assert body == {"name": "widget"}
+        assert headers == {"X-Trace": "abc123"}
+        assert query == {"dryRun": "yes"}
+
+    def test_body_becomes_none_when_only_query_supplied(self):
+        cmd = extract_openapi_commands(_mixed_location_spec())[0]
+        args = argparse.Namespace(
+            tenant_id="acme", dry_run=None, region="eu", x_trace=None,
+            name=None, qty=None, stdin=False,
+        )
+        path, query, headers, body, files = _collect_openapi_params(cmd, args)
+        assert body is None
+        assert query == {"region": "eu"}
+
+    def test_query_and_header_still_collected_with_stdin_body(self, monkeypatch):
+        import io
+        cmd = extract_openapi_commands(_mixed_location_spec())[0]
+        monkeypatch.setattr(sys, "stdin", io.StringIO('{"name": "from-stdin"}'))
+        args = argparse.Namespace(
+            tenant_id="acme", dry_run=None, region="eu", x_trace="abc123",
+            name=None, qty=None, stdin=True,
+        )
+        path, query, headers, body, files = _collect_openapi_params(cmd, args)
+        assert body == {"name": "from-stdin"}
+        assert query == {"region": "eu"}
+        assert headers == {"X-Trace": "abc123"}
+
+    def test_get_verb_unaffected(self):
+        cmd = extract_openapi_commands(_mixed_location_spec("get"))[0]
+        args = argparse.Namespace(
+            tenant_id="acme", dry_run=None, region="eu", x_trace="abc123",
+            name=None, qty=None, stdin=False,
+        )
+        path, query, headers, body, files = _collect_openapi_params(cmd, args)
+        assert body is None
+        assert query == {"region": "eu"}
+        assert headers == {"X-Trace": "abc123"}
+        assert path == "/tenants/acme/items"
+
+
+# ---------------------------------------------------------------------------
+# Wire-level checks against a server with a strict body schema
+# ---------------------------------------------------------------------------
+
+_STRICT_SPEC = {
+    "openapi": "3.0.0",
+    "info": {"title": "Strict", "version": "1.0.0"},
+    "paths": {
+        "/tenants/{tenantId}/items": {
+            "post": {
+                "operationId": "createItem",
+                "parameters": [
+                    {"name": "tenantId", "in": "path", "required": True,
+                     "schema": {"type": "string"}},
+                    {"name": "region", "in": "query", "schema": {"type": "string"}},
+                    {"name": "archived", "in": "query",
+                     "schema": {"type": "boolean", "default": True}},
+                    {"name": "X-Trace", "in": "header", "schema": {"type": "string"}},
+                ],
+                "requestBody": {"content": {"application/json": {"schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "qty": {"type": "integer"},
+                    },
+                }}}},
+                "responses": {},
+            },
+        }
+    },
+}
+
+
+class _StrictItemsHandler(BaseHTTPRequestHandler):
+    """Echoes the request it received, rejecting unknown body fields with 400."""
+
+    BODY_FIELDS = {"name", "qty"}
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send_json(self, data, status=200):
+        payload = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _echo(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/openapi.json":
+            self._send_json(_STRICT_SPEC)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        body = json.loads(raw) if raw else {}
+        unexpected = sorted(set(body) - self.BODY_FIELDS)
+        if unexpected:
+            self._send_json(
+                {"error": "unexpected body fields", "fields": unexpected}, 400
+            )
+            return
+        self._send_json({
+            "method": self.command,
+            "path": parsed.path,
+            "query": {k: v[0] for k, v in parse_qs(parsed.query).items()},
+            "body": body,
+            "trace": self.headers.get("X-Trace"),
+        })
+
+    do_GET = _echo
+    do_POST = _echo
+
+
+@pytest.fixture(scope="module")
+def strict_items_server():
+    server = HTTPServer(("127.0.0.1", 0), _StrictItemsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+class TestStrictBodySchemaOnTheWire:
+    """The request that actually leaves the client separates query from body."""
+
+    def _cmd(self, server, *args):
+        return [
+            sys.executable, "-m", "mcp2cli",
+            "--spec", f"{server}/openapi.json",
+            "--base-url", server,
+            *args,
+        ]
+
+    def test_post_keeps_query_out_of_the_json_body(self, strict_items_server):
+        r = subprocess.run(
+            self._cmd(
+                strict_items_server, "create-item",
+                "--tenant-id", "acme", "--region", "eu",
+                "--x-trace", "t-1", "--name", "widget", "--qty", "3",
+            ),
+            capture_output=True, text=True, timeout=15,
+        )
+        assert r.returncode == 0, r.stderr
+        echo = json.loads(r.stdout)
+        assert echo["path"] == "/tenants/acme/items"
+        assert echo["query"] == {"region": "eu"}
+        assert echo["body"] == {"name": "widget", "qty": 3}
+        assert echo["trace"] == "t-1"
+
+    def test_stdin_body_still_carries_query_and_header(self, strict_items_server):
+        r = subprocess.run(
+            self._cmd(
+                strict_items_server, "create-item",
+                "--tenant-id", "acme", "--region", "eu",
+                "--x-trace", "t-2", "--stdin",
+            ),
+            capture_output=True, text=True,
+            input='{"name": "from-stdin"}', timeout=15,
+        )
+        assert r.returncode == 0, r.stderr
+        echo = json.loads(r.stdout)
+        assert echo["query"] == {"region": "eu"}
+        assert echo["body"] == {"name": "from-stdin"}
+        assert echo["trace"] == "t-2"
+
+    def test_boolean_query_param_can_be_sent_as_false(self, strict_items_server):
+        base = ["create-item", "--tenant-id", "acme", "--name", "widget"]
+        sent = {}
+        for flag in ("--no-archived", "--archived"):
+            r = subprocess.run(
+                self._cmd(strict_items_server, *base, flag),
+                capture_output=True, text=True, timeout=15,
+            )
+            assert r.returncode == 0, r.stderr
+            sent[flag] = json.loads(r.stdout)["query"]
+        assert sent == {
+            "--no-archived": {"archived": "false"},
+            "--archived": {"archived": "true"},
+        }

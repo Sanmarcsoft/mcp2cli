@@ -1,5 +1,6 @@
 """Tests for MCP mode — stdio and HTTP transports."""
 
+import builtins
 import json
 import subprocess
 import sys
@@ -8,6 +9,25 @@ from pathlib import Path
 import pytest
 
 MCP_SERVER = str(Path(__file__).parent / "mcp_test_server.py")
+
+
+def _mcp_error_api():
+    """Return (error factory, CONNECTION_CLOSED) for the installed MCP SDK."""
+    try:  # MCP SDK v2
+        from mcp.shared.exceptions import MCPError
+        from mcp_types import CONNECTION_CLOSED
+
+        return (lambda code, message: MCPError(code=code, message=message)), CONNECTION_CLOSED
+    except ImportError:  # MCP SDK v1
+        from mcp.shared.exceptions import McpError
+        from mcp.types import CONNECTION_CLOSED, ErrorData
+
+        return (
+            lambda code, message: McpError(ErrorData(code=code, message=message))
+        ), CONNECTION_CLOSED
+
+
+_make_mcp_error, _CONNECTION_CLOSED = _mcp_error_api()
 
 
 class TestMCPStdio:
@@ -51,6 +71,31 @@ class TestMCPStdio:
         r = self._run("add-numbers", "--a", "3", "--b", "7")
         assert r.returncode == 0
         assert "10" in r.stdout
+
+    def test_optional_params_keep_their_type(self):
+        """Optional[list/int/bool] arrive as anyOf [T, null] from pydantic."""
+        r = self._run(
+            "--refresh", "echo-optional", "--tags", "a,b", "--count", "3", "--verbose"
+        )
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {"count": 3, "tags": ["a", "b"], "verbose": True}
+
+    def test_boolean_can_be_sent_as_false(self):
+        """`--no-<flag>` sends false; `--<flag>` still sends true; omitted sends nothing."""
+        r = self._run("--refresh", "echo-optional", "--no-verbose")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {"verbose": False}
+        r = self._run("echo-optional", "--verbose")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {"verbose": True}
+        r = self._run("echo-optional")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {}
+
+    def test_optional_array_help_hint(self):
+        r = self._run("--refresh", "echo-optional", "--help")
+        assert r.returncode == 0
+        assert "(JSON array)" in r.stdout
 
     def test_list_items(self):
         r = self._run("list-items", "--path", "/tmp")
@@ -101,6 +146,32 @@ class TestMCPStdio:
         r = self._run("echo", "--stdin", stdin_data='{"message":')
         assert r.returncode != 0
         assert "invalid JSON" in r.stderr
+
+    def test_stdin_merges_parameter_flags(self):
+        r = self._run("add-numbers", "--a", "3", "--stdin", stdin_data='{"b": 7}')
+        assert r.returncode == 0, r.stderr
+        assert "10" in r.stdout
+
+    def test_stdin_accepts_flag_matching_json(self):
+        r = self._run(
+            "add-numbers", "--a", "3", "--stdin", stdin_data='{"a": 3, "b": 7}'
+        )
+        assert r.returncode == 0, r.stderr
+        assert "10" in r.stdout
+
+    def test_stdin_rejects_flag_conflicting_with_json(self):
+        r = self._run(
+            "echo", "--message", "flag", "--stdin", stdin_data='{"message": "json"}'
+        )
+        assert r.returncode != 0
+        assert "--message" in r.stderr
+        assert "conflict" in r.stderr
+        assert r.stdout == ""
+
+    def test_stdin_flags_need_a_json_object(self):
+        r = self._run("echo", "--message", "flag", "--stdin", stdin_data="[1]")
+        assert r.returncode != 0
+        assert "JSON object" in r.stderr
 
     def test_no_subcommand_shows_tools(self):
         r = self._run()
@@ -717,3 +788,105 @@ class TestConnectionErrors:
         )
         assert r.returncode != 0
         assert "Traceback" in r.stderr
+
+
+    def test_empty_end_of_stream_gets_disconnect_hint(self, capsys):
+        import anyio
+
+        from mcp2cli import _run_mcp_clean
+
+        async def end_of_stream():
+            raise anyio.EndOfStream()
+
+        with pytest.raises(SystemExit) as caught:
+            _run_mcp_clean(end_of_stream, "test")
+
+        assert caught.value.code == 1
+        err = capsys.readouterr().err
+        assert "cannot use MCP server at test" in err
+        assert "disconnected unexpectedly" in err
+
+    def test_broken_pipe_inside_nested_groups_gets_disconnect_hint(self, capsys):
+        from mcp2cli import _run_mcp_clean
+
+        if sys.version_info < (3, 11):
+            from exceptiongroup import BaseExceptionGroup
+        else:
+            BaseExceptionGroup = builtins.BaseExceptionGroup
+
+        async def broken_pipe():
+            raise BaseExceptionGroup(
+                "outer",
+                [BaseExceptionGroup("inner", [BrokenPipeError(32, "Broken pipe")])],
+            )
+
+        with pytest.raises(SystemExit):
+            _run_mcp_clean(broken_pipe, "test")
+
+        err = capsys.readouterr().err
+        assert "Broken pipe" in err
+        assert "disconnected unexpectedly" in err
+
+    def test_unrelated_failure_gets_no_disconnect_hint(self, capsys):
+        from mcp2cli import _run_mcp_clean
+
+        async def unrelated():
+            raise RuntimeError("no package metadata for endofstream disconnect")
+
+        with pytest.raises(SystemExit):
+            _run_mcp_clean(unrelated, "test")
+
+        err = capsys.readouterr().err
+        assert "no package metadata" in err
+        assert "disconnected unexpectedly" not in err
+
+    def test_sdk_connection_closed_error_gets_disconnect_hint(self, capsys):
+        from mcp2cli import _run_mcp_clean
+
+        error = _make_mcp_error(_CONNECTION_CLOSED, "Connection closed")
+
+        async def connection_closed():
+            raise error
+
+        with pytest.raises(SystemExit):
+            _run_mcp_clean(connection_closed, "test")
+
+        err = capsys.readouterr().err
+        assert "Connection closed" in err
+        assert "disconnected unexpectedly" in err
+
+    def test_other_sdk_error_gets_no_disconnect_hint(self, capsys):
+        from mcp2cli import _run_mcp_clean
+
+        error = _make_mcp_error(-32602, "Invalid params")
+
+        async def invalid_params():
+            raise error
+
+        with pytest.raises(SystemExit):
+            _run_mcp_clean(invalid_params, "test")
+
+        err = capsys.readouterr().err
+        assert "Invalid params" in err
+        assert "disconnected unexpectedly" not in err
+
+    def test_stdio_server_exiting_immediately_hints_at_disconnect(self):
+        r = self._run(
+            "--mcp-stdio", f"{sys.executable} -c pass", "--list"
+        )
+        assert r.returncode != 0
+        assert "Traceback" not in r.stderr
+        assert "disconnected unexpectedly" in r.stderr
+
+    def test_disconnect_in_debug_mode_reraises_original(self, monkeypatch):
+        import anyio
+
+        from mcp2cli import _run_mcp_clean
+
+        monkeypatch.setenv("MCP2CLI_DEBUG", "1")
+
+        async def end_of_stream():
+            raise anyio.EndOfStream()
+
+        with pytest.raises(anyio.EndOfStream):
+            _run_mcp_clean(end_of_stream, "test")
