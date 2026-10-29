@@ -1,5 +1,6 @@
 """Tests for GraphQL support."""
 
+import argparse
 import json
 import subprocess
 import sys
@@ -383,6 +384,16 @@ class TestGraphQLIntegration:
         data = json.loads(r.stdout)
         assert data["name"] == "StdinUser"
 
+    def test_stdin_merges_flags_into_variables(self, graphql_server):
+        r = _run(
+            ["--graphql", graphql_server, "create-user", "--email", "flag@example.com", "--stdin"],
+            input_data=json.dumps({"name": "StdinUser"}),
+        )
+        assert r.returncode == 0, r.stderr
+        data = json.loads(r.stdout)
+        assert data["name"] == "StdinUser"
+        assert data["email"] == "flag@example.com"
+
     def test_list_arg_comma_delimited(self, graphql_server):
         r = _run(["--graphql", graphql_server, "users-by-ids", "--ids", "1,2"])
         assert r.returncode == 0
@@ -394,3 +405,134 @@ class TestGraphQLIntegration:
         assert r.returncode == 0
         data = json.loads(r.stdout)
         assert isinstance(data, list)
+
+
+def _name_collision_schema(query_fields=(), mutation_fields=()):
+    """Minimal introspection schema with the given Query/Mutation field names."""
+    def field(name):
+        return {
+            "name": name,
+            "description": None,
+            "args": [],
+            "type": {"kind": "SCALAR", "name": "String", "ofType": None},
+        }
+
+    return {
+        "queryType": {"name": "Query"},
+        "mutationType": {"name": "Mutation"} if mutation_fields else None,
+        "types": [
+            {
+                "name": "Query",
+                "kind": "OBJECT",
+                "fields": [field(n) for n in query_fields],
+            },
+            {
+                "name": "Mutation",
+                "kind": "OBJECT",
+                "fields": [field(n) for n in mutation_fields],
+            },
+        ],
+    }
+
+
+class TestGraphQLNameCollisions:
+    """Fields that kebab-case onto the same name must stay addressable."""
+
+    def test_three_way_kebab_collision_stays_unique(self):
+        schema = _name_collision_schema(
+            query_fields=["getUser", "get_user", "GetUser"]
+        )
+        names = [c.name for c in mcp2cli.extract_graphql_commands(schema)]
+        assert len(names) == len(set(names))
+        assert names == ["get-user", "query-get-user", "query-get-user-2"]
+
+    def test_three_way_collision_builds_a_parser(self):
+        # Duplicate subparser names raise argparse.ArgumentError, which took
+        # down every command rather than just the colliding ones.
+        schema = _name_collision_schema(
+            query_fields=["getUser", "get_user", "GetUser"]
+        )
+        cmds = mcp2cli.extract_graphql_commands(schema)
+        parser = mcp2cli.build_argparse(cmds, argparse.ArgumentParser(add_help=False))
+        for cmd in cmds:
+            assert parser.parse_args([cmd.name])._cmd is cmd
+
+    def test_alias_never_shadows_another_fields_natural_name(self):
+        schema = _name_collision_schema(
+            query_fields=["getUser", "get_user", "queryGetUser"]
+        )
+        cmds = mcp2cli.extract_graphql_commands(schema)
+        by_field = {c.graphql_field_name: c.name for c in cmds}
+        # queryGetUser owns `query-get-user`; the alias for get_user must
+        # not take it.
+        assert by_field["queryGetUser"] == "query-get-user"
+        assert by_field["getUser"] == "get-user"
+        assert len(set(by_field.values())) == 3
+
+    def test_query_mutation_overlap_still_prefixed_symmetrically(self):
+        schema = _name_collision_schema(
+            query_fields=["user"], mutation_fields=["user"]
+        )
+        cmds = mcp2cli.extract_graphql_commands(schema)
+        assert [c.name for c in cmds] == ["query-user", "mutation-user"]
+
+    def test_cross_type_kebab_collision_is_disambiguated(self):
+        schema = _name_collision_schema(
+            query_fields=["getUser"], mutation_fields=["get_user"]
+        )
+        names = [c.name for c in mcp2cli.extract_graphql_commands(schema)]
+        assert len(names) == len(set(names))
+        assert names == ["get-user", "mutation-get-user"]
+
+    def test_introspection_fields_still_skipped(self):
+        schema = _name_collision_schema(
+            query_fields=["__schema", "__type", "user"]
+        )
+        assert [c.name for c in mcp2cli.extract_graphql_commands(schema)] == ["user"]
+
+    def test_non_colliding_names_are_untouched(self):
+        schema = _name_collision_schema(
+            query_fields=["listUsers"], mutation_fields=["createUser"]
+        )
+        assert [c.name for c in mcp2cli.extract_graphql_commands(schema)] == [
+            "list-users",
+            "create-user",
+        ]
+
+    def test_numbered_alias_never_shadows_a_natural_name(self):
+        schema = _name_collision_schema(
+            query_fields=["getUser", "get_user", "queryGetUser", "query_get_user_2"]
+        )
+        cmds = mcp2cli.extract_graphql_commands(schema)
+        by_field = {c.graphql_field_name: c.name for c in cmds}
+        assert by_field["queryGetUser"] == "query-get-user"
+        assert by_field["query_get_user_2"] == "query-get-user-2"
+        assert by_field["get_user"] == "query-get-user-3"
+        assert len(set(by_field.values())) == 4
+
+    def test_aliased_command_still_queries_its_original_field(self):
+        # The CLI rename must not leak into the wire request: the aliased
+        # command has to select the field it was generated from.
+        schema = _name_collision_schema(query_fields=["getUser", "get_user"])
+        aliased = mcp2cli.extract_graphql_commands(schema)[1]
+        assert aliased.name == "query-get-user"
+
+        document, variables, field_name = mcp2cli._build_graphql_document(
+            aliased, argparse.Namespace(), schema
+        )
+        assert field_name == "get_user"
+        assert document.startswith("query {")
+        assert "get_user" in document
+        assert "query-get-user" not in document
+        assert variables == {}
+
+    def test_aliased_mutation_still_sends_a_mutation(self):
+        schema = _name_collision_schema(mutation_fields=["getUser", "get_user"])
+        aliased = mcp2cli.extract_graphql_commands(schema)[1]
+        assert aliased.name == "mutation-get-user"
+
+        document, _, field_name = mcp2cli._build_graphql_document(
+            aliased, argparse.Namespace(), schema
+        )
+        assert field_name == "get_user"
+        assert document.startswith("mutation {")

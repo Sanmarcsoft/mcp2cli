@@ -273,3 +273,147 @@ class TestMCPStdioCaching:
         r = self._run_mcp("--cache-ttl", "1", "echo", "--message", "refreshed", cache_dir=cd)
         assert r.returncode == 0
         assert "refreshed" in r.stdout
+
+
+class TestCacheCorruptionResilience:
+    """A damaged cache entry must cost one refetch, not every later run."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        import mcp2cli
+        monkeypatch.setattr(mcp2cli, "CACHE_DIR", tmp_path)
+        return mcp2cli
+
+    def test_truncated_entry_is_treated_as_a_miss(self, monkeypatch, tmp_path):
+        m = self._isolate(monkeypatch, tmp_path)
+        (tmp_path / "abc.json").write_text('{"paths": {"/a"')
+        assert m.load_cached("abc", 3600) is None
+
+    def test_empty_entry_is_treated_as_a_miss(self, monkeypatch, tmp_path):
+        m = self._isolate(monkeypatch, tmp_path)
+        (tmp_path / "abc.json").write_text("")
+        assert m.load_cached("abc", 3600) is None
+
+    def test_non_utf8_entry_is_treated_as_a_miss(self, monkeypatch, tmp_path):
+        m = self._isolate(monkeypatch, tmp_path)
+        (tmp_path / "abc.json").write_bytes(b"\xff\xfe\x00garbage")
+        assert m.load_cached("abc", 3600) is None
+
+    def test_corrupt_entry_is_overwritten_by_the_next_save(
+        self, monkeypatch, tmp_path
+    ):
+        m = self._isolate(monkeypatch, tmp_path)
+        (tmp_path / "abc.json").write_text("not json at all")
+        assert m.load_cached("abc", 3600) is None
+        m.save_cache("abc", {"paths": {"/pets": {}}})
+        assert m.load_cached("abc", 3600) == {"paths": {"/pets": {}}}
+
+    def test_valid_entry_still_round_trips(self, monkeypatch, tmp_path):
+        m = self._isolate(monkeypatch, tmp_path)
+        m.save_cache("abc", {"hello": "world"})
+        assert m.load_cached("abc", 3600) == {"hello": "world"}
+
+    def test_expiry_still_honoured(self, monkeypatch, tmp_path):
+        m = self._isolate(monkeypatch, tmp_path)
+        m.save_cache("abc", {"hello": "world"})
+        assert m.load_cached("abc", 0) is None
+
+    def test_save_leaves_no_temp_files_behind(self, monkeypatch, tmp_path):
+        m = self._isolate(monkeypatch, tmp_path)
+        m.save_cache("abc", {"hello": "world"})
+        assert [q.name for q in tmp_path.iterdir()] == ["abc.json"]
+
+    def test_failed_serialisation_leaves_previous_entry_intact(
+        self, monkeypatch, tmp_path
+    ):
+        m = self._isolate(monkeypatch, tmp_path)
+        m.save_cache("abc", {"good": True})
+        # Serialisation happens before the file is touched, so an
+        # unserialisable payload cannot destroy the entry that is already
+        # on disk.
+        with pytest.raises(TypeError):
+            m.save_cache("abc", {"bad": object()})
+        assert m.load_cached("abc", 3600) == {"good": True}
+        assert [q.name for q in tmp_path.iterdir()] == ["abc.json"]
+
+    def test_concurrent_writers_never_expose_a_partial_entry(
+        self, monkeypatch, tmp_path
+    ):
+        """Threads of one process must not splice each other's writes.
+
+        Every reader has to see one writer's payload whole. A torn entry
+        shows up as a miss (load_cached swallows the damage), so a reader
+        that gets None while an entry has existed the whole time is the
+        observable symptom.
+        """
+        m = self._isolate(monkeypatch, tmp_path)
+        blob_len = 200_000
+        payloads = [{"writer": i, "blob": str(i) * blob_len} for i in range(4)]
+        m.save_cache("abc", payloads[0])
+
+        def intact(entry):
+            return (
+                isinstance(entry, dict)
+                and entry.get("blob") == str(entry.get("writer")) * blob_len
+            )
+
+        stop = threading.Event()
+        bad_reads = []
+        write_errors = []
+
+        def writer(payload):
+            try:
+                for _ in range(15):
+                    m.save_cache("abc", payload)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                write_errors.append(repr(exc))
+
+        def reader():
+            while not stop.is_set():
+                entry = m.load_cached("abc", 3600)
+                if not intact(entry):
+                    bad_reads.append(entry if entry is None else "spliced")
+
+        readers = [threading.Thread(target=reader) for _ in range(2)]
+        for t in readers:
+            t.start()
+        writers = [threading.Thread(target=writer, args=(p,)) for p in payloads]
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join(timeout=60)
+        stop.set()
+        for t in readers:
+            t.join(timeout=60)
+
+        assert write_errors == []
+        assert bad_reads == []
+        assert intact(m.load_cached("abc", 3600))
+        assert [q.name for q in tmp_path.iterdir()] == ["abc.json"]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [OSError(28, "No space left on device"), KeyboardInterrupt()],
+        ids=["disk-full", "ctrl-c"],
+    )
+    def test_failed_publish_preserves_the_previous_entry(
+        self, monkeypatch, tmp_path, failure
+    ):
+        """A save that dies before publishing keeps the entry already on disk.
+
+        A disk filling up and a Ctrl-C are the two ways this happens in
+        practice; neither may destroy a good entry or leave debris in the
+        cache directory.
+        """
+        m = self._isolate(monkeypatch, tmp_path)
+        m.save_cache("abc", {"good": True})
+
+        def boom(*_args, **_kwargs):
+            raise failure
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(m.os, "replace", boom)
+            with pytest.raises(type(failure)):
+                m.save_cache("abc", {"replacement": True})
+
+        assert m.load_cached("abc", 3600) == {"good": True}
+        assert [q.name for q in tmp_path.iterdir()] == ["abc.json"]

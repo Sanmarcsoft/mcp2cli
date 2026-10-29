@@ -4,6 +4,9 @@ import argparse
 import asyncio
 import json
 import shutil
+import sys
+
+import pytest
 
 from mcp2cli import (
     ParamDef,
@@ -74,6 +77,53 @@ class TestSchemaTypeToPython:
     def test_missing_type_bool_enum_not_inferred(self):
         # bool is a subclass of int; don't misread a bool enum as int
         assert schema_type_to_python({"enum": [True, False]}) == (str, "")
+
+    # anyOf/oneOf unions with a numeric branch (#123)
+    def test_numeric_only_union(self):
+        assert schema_type_to_python(
+            {"anyOf": [{"type": "integer"}, {"type": "null"}, {"type": "integer", "minimum": 5}]}
+        ) == (int, "")
+        assert schema_type_to_python({"oneOf": [{"type": "number"}, {"type": "null"}]}) == (float, "")
+
+    def test_empty_string_or_integer_union(self):
+        py_type, suffix = schema_type_to_python(
+            {"anyOf": [{"type": "string", "const": ""}, {"type": "integer", "minimum": 1}]}
+        )
+        assert suffix == ""
+        assert py_type("6") == 6 and isinstance(py_type("6"), int)
+        assert py_type("") == ""
+
+    def test_string_or_integer_union_keeps_strings(self):
+        py_type, _ = schema_type_to_python({"anyOf": [{"type": "string"}, {"type": "integer"}]})
+        assert py_type("42") == 42
+        assert py_type("abc") == "abc"
+        assert py_type.__name__ == "int|str"
+
+    def test_string_or_number_union(self):
+        py_type, _ = schema_type_to_python({"oneOf": [{"type": "string"}, {"type": "number"}]})
+        assert py_type("2.5") == 2.5
+        assert py_type("x") == "x"
+
+    def test_integer_or_number_union(self):
+        py_type, _ = schema_type_to_python({"anyOf": [{"type": "integer"}, {"type": "number"}]})
+        assert py_type("3") == 3 and isinstance(py_type("3"), int)
+        assert py_type("3.5") == 3.5
+        with pytest.raises(ValueError):
+            py_type("abc")
+
+    def test_nested_union(self):
+        py_type, _ = schema_type_to_python(
+            {"anyOf": [{"anyOf": [{"type": "integer"}, {"type": "null"}]}, {"type": "null"}]}
+        )
+        assert py_type is int
+
+    def test_non_numeric_union_stays_str(self):
+        assert schema_type_to_python({"anyOf": [{"type": "string"}, {"type": "boolean"}]}) == (str, "")
+
+    def test_top_level_type_wins_over_union(self):
+        assert schema_type_to_python(
+            {"type": "string", "anyOf": [{"type": "integer"}, {"type": "string"}]}
+        ) == (str, "")
 
 
 class TestCoerceValue:
@@ -431,6 +481,50 @@ class TestExtractOpenAPICommands:
         limit_param = next(p for p in list_pets.params if p.original_name == "limit")
         assert limit_param.schema.get("type") == "integer"
 
+    def test_nullable_anyof_params(self):
+        """FastAPI emits OpenAPI 3.1 Optional params as anyOf [T, null]."""
+        spec = {
+            "openapi": "3.1.0",
+            "paths": {
+                "/items": {
+                    "post": {
+                        "operationId": "createItem",
+                        "parameters": [
+                            {
+                                "name": "limit",
+                                "in": "query",
+                                "schema": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                            }
+                        ],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "tags": {
+                                                "anyOf": [
+                                                    {"type": "array", "items": {"type": "string"}},
+                                                    {"type": "null"},
+                                                ]
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            },
+        }
+        cmd = extract_openapi_commands(spec)[0]
+        limit = next(p for p in cmd.params if p.original_name == "limit")
+        tags = next(p for p in cmd.params if p.original_name == "tags")
+        assert limit.python_type is int
+        assert coerce_value("5", limit.schema) == 5
+        assert tags.description.endswith("(JSON array)")
+        assert coerce_value("a,b", tags.schema) == ["a", "b"]
+
 
 class TestExtractMCPCommands:
     def test_basic(self):
@@ -493,6 +587,79 @@ class TestExtractMCPCommands:
         assert first == reordered
         assert first["get_user_2"] == "get-user-2"
 
+    # Pydantic (FastMCP, the official SDK's MCPServer) writes Optional[T] as
+    # {"anyOf": [{T}, {"type": "null"}]} with no top-level "type".
+    @pytest.mark.parametrize(
+        "prop, raw, py_type, suffix, expected",
+        [
+            (
+                {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
+                "a,b", str, " (JSON array)", ["a", "b"],
+            ),
+            (
+                {"anyOf": [{"type": "array", "items": {"type": "integer"}}, {"type": "null"}]},
+                "1,2", str, " (JSON array)", [1, 2],
+            ),
+            ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "3", int, "", 3),
+            ({"anyOf": [{"type": "number"}, {"type": "null"}]}, "2.5", float, "", 2.5),
+            ({"anyOf": [{"type": "null"}, {"type": "integer"}]}, "3", int, "", 3),
+            ({"oneOf": [{"type": "integer"}, {"type": "null"}]}, "3", int, "", 3),
+            (
+                {"anyOf": [{"type": "object"}, {"type": "null"}]},
+                '{"k": 1}', str, " (JSON object)", {"k": 1},
+            ),
+        ],
+        ids=["str-array", "int-array", "integer", "number", "null-first", "oneOf", "object"],
+    )
+    def test_nullable_anyof_keeps_type(self, prop, raw, py_type, suffix, expected):
+        prop = {**prop, "default": None, "title": "X"}
+        tools = [{"name": "t", "inputSchema": {"type": "object", "properties": {"x": prop}}}]
+        p = extract_mcp_commands(tools)[0].params[0]
+        assert p.python_type is py_type
+        assert p.description == "x" + suffix
+        assert coerce_value(raw, p.schema) == expected
+
+    def test_nullable_anyof_boolean_is_flag(self):
+        prop = {"anyOf": [{"type": "boolean"}, {"type": "null"}], "default": None}
+        tools = [{"name": "t", "inputSchema": {"type": "object", "properties": {"v": prop}}}]
+        p = extract_mcp_commands(tools)[0].params[0]
+        assert p.python_type is None  # store_true, like a plain boolean
+        assert coerce_value(True, p.schema) is True
+
+    def test_nullable_anyof_keeps_outer_description_and_enum(self):
+        prop = {
+            "anyOf": [{"type": "string", "enum": ["asc", "desc"]}, {"type": "null"}],
+            "description": "Sort order",
+            "default": None,
+        }
+        tools = [{"name": "t", "inputSchema": {"type": "object", "properties": {"o": prop}}}]
+        p = extract_mcp_commands(tools)[0].params[0]
+        assert p.description == "Sort order"
+        assert p.choices == ["asc", "desc"]
+
+    @pytest.mark.parametrize(
+        "prop",
+        [
+            # A real union: which branch applies is ambiguous, so leave it alone.
+            {"anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}]},
+            {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+            # A top-level "type" already wins.
+            {"type": "string", "anyOf": [{"format": "date"}, {"type": "null"}]},
+        ],
+        ids=["wide-union", "no-null", "top-level-type"],
+    )
+    def test_other_unions_unchanged(self, prop):
+        tools = [{"name": "t", "inputSchema": {"type": "object", "properties": {"x": prop}}}]
+        p = extract_mcp_commands(tools)[0].params[0]
+        assert p.schema == prop
+        if "type" in prop:
+            assert p.python_type is str  # a top-level "type" still wins
+        else:
+            # A wider union with a numeric branch sends numbers as numbers and
+            # keeps anything else as a string (#123).
+            assert p.python_type("7") == 7
+            assert p.python_type("abc") == "abc"
+
 
 class TestBuildArgparseReservedFlags:
     """A tool property named help/stdin used to raise 'conflicting option
@@ -510,6 +677,20 @@ class TestBuildArgparseReservedFlags:
         ]
         pre = argparse.ArgumentParser(add_help=False)
         return build_argparse(extract_mcp_commands(tools), pre)
+
+    def test_numeric_union_parses_to_number(self):
+        # #123: anyOf [{"type": "string", "const": ""}, {"type": "integer"}]
+        parser = self._build(
+            {
+                "precision": {
+                    "anyOf": [{"type": "string", "const": ""}, {"type": "integer", "minimum": 1}]
+                },
+                "id": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            }
+        )
+        args = parser.parse_args(["weird", "--precision", "6", "--id", "abc"])
+        assert args.precision == 6 and isinstance(args.precision, int)
+        assert args.id == "abc"
 
     def test_help_property_does_not_brick_parser(self):
         parser = self._build({"help": {"type": "string"}})
@@ -544,6 +725,33 @@ class TestBuildArgparseReservedFlags:
         )
         assert args.arg_help_2 == "reserved"
         assert args.arg_help == "natural"
+
+
+class TestBuildArgparseBooleanFlags:
+    """A boolean parameter must be sendable as false as well as true."""
+
+    def _build(self, props):
+        from mcp2cli import build_argparse
+
+        tools = [{"name": "t", "inputSchema": {"type": "object", "properties": props}}]
+        pre = argparse.ArgumentParser(add_help=False)
+        return build_argparse(extract_mcp_commands(tools), pre)
+
+    def test_no_flag_sends_false(self):
+        parser = self._build({"recursive": {"type": "boolean", "default": True}})
+        assert parser.parse_args(["t", "--no-recursive"]).recursive is False
+        assert parser.parse_args(["t", "--recursive"]).recursive is True
+        assert parser.parse_args(["t"]).recursive is None
+
+    def test_existing_no_property_keeps_its_flag(self):
+        # A real `no-cache` property owns `--no-cache`; the `cache` boolean
+        # then stays a plain on-switch instead of failing the parser build.
+        parser = self._build(
+            {"cache": {"type": "boolean"}, "no-cache": {"type": "string"}}
+        )
+        args = parser.parse_args(["t", "--cache", "--no-cache", "x"])
+        assert args.cache is True
+        assert getattr(args, "no_cache") == "x"
 
 
 class TestSplitAtSubcommand:
@@ -810,3 +1018,197 @@ class TestExtractContentParts:
             {"type": "resource_link", "uri": "probe://linked", "name": "linked-doc"},
         ]
         assert _extract_content_parts(blocks) == "see:\nlinked-doc: probe://linked"
+
+
+class TestResolveRefsRobustness:
+    """A spec we did not write must not crash ref resolution."""
+
+    @staticmethod
+    def _spec(ref, **root):
+        """A spec whose only ``$ref`` sits at paths./x.get.schema."""
+        return {"paths": {"/x": {"get": {"schema": {"$ref": ref}}}}, **root}
+
+    @staticmethod
+    def _schema(resolved):
+        return resolved["paths"]["/x"]["get"]["schema"]
+
+    def test_dangling_ref_is_left_unresolved_and_named(self, capsys):
+        spec = {
+            "paths": {
+                "/x": {
+                    "get": {
+                        "parameters": [
+                            {"$ref": "#/components/parameters/Missing"}
+                        ]
+                    }
+                }
+            },
+        }
+        resolved = resolve_refs(spec)
+        # Left unresolved -- the same shape a cycle or external ref produces.
+        assert resolved["paths"]["/x"]["get"]["parameters"][0] == {
+            "$ref": "#/components/parameters/Missing"
+        }
+        assert "#/components/parameters/Missing" in capsys.readouterr().err
+
+    def test_dangling_ref_reported_once_per_ref(self, capsys):
+        ref = {"$ref": "#/nope"}
+        spec = {"paths": {"/a": {"get": {"x": dict(ref)}},
+                          "/b": {"get": {"x": dict(ref)}}}}
+        resolve_refs(spec)
+        assert capsys.readouterr().err.count("#/nope") == 1
+
+    def test_resolvable_ref_is_silent(self, capsys):
+        spec = self._spec("#/components/Ok", components={"Ok": {"type": "integer"}})
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+        assert capsys.readouterr().err == ""
+
+    def test_json_pointer_escapes_are_decoded(self):
+        # RFC 6901: ~1 -> /  and  ~0 -> ~
+        spec = self._spec(
+            "#/components/a~1b/c~0d",
+            components={"a/b": {"c~d": {"type": "integer"}}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+
+    def test_tilde_escape_decoding_order(self):
+        # ~01 is the literal name "~1", never the separator "/".
+        spec = self._spec(
+            "#/components/~01",
+            components={"~1": {"type": "integer"}, "/": {"type": "string"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+
+    def test_array_index_tokens_resolve(self):
+        shared = [{"type": "string"}, {"type": "integer"}]
+        assert self._schema(
+            resolve_refs(self._spec("#/shared/0", shared=shared))
+        ) == {"type": "string"}
+        assert self._schema(
+            resolve_refs(self._spec("#/shared/1", shared=shared))
+        ) == {"type": "integer"}
+
+    def test_malformed_array_indices_select_nothing(self):
+        # int() would take every one of these -- "-1" would hand back the
+        # *last* element, "01"/" 1"/"1_0"/"\u0661" some other element.
+        for token in ["-1", "+1", "01", " 1", "1 ", "1_0", "\u0661", "1.0", ""]:
+            ref = f"#/shared/{token}"
+            spec = self._spec(ref, shared=[{"type": "string"}, {"type": "integer"}])
+            assert self._schema(resolve_refs(spec)) == {"$ref": ref}, token
+
+    def test_out_of_range_array_index_selects_nothing(self):
+        spec = self._spec("#/shared/2", shared=[{"type": "string"}])
+        assert self._schema(resolve_refs(spec)) == {"$ref": "#/shared/2"}
+
+    def test_huge_index_token_does_not_depend_on_int_limit(self):
+        ref = "#/shared/" + "9" * 6000
+        spec = self._spec(ref, shared=[{"type": "string"}])
+        limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(0)  # 0 disables CPython's conversion guard
+        try:
+            resolved = resolve_refs(spec)
+        finally:
+            sys.set_int_max_str_digits(limit)
+        assert self._schema(resolved) == {"$ref": ref}
+
+    def test_numeric_and_signed_dict_keys_still_resolve(self):
+        # Array-index screening must not reach dict keys, which are plain
+        # strings: OpenAPI response maps are keyed "200", "404", ...
+        spec = self._spec(
+            "#/responses/200",
+            responses={"200": {"type": "integer"}, "-1": {"type": "string"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+        spec = self._spec(
+            "#/responses/-1",
+            responses={"200": {"type": "integer"}, "-1": {"type": "string"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "string"}
+
+    def test_percent_encoded_fragment_resolves(self):
+        # RFC 6901 section 6: a pointer inside a URI fragment is
+        # percent-encoded, so a space arrives as %20 and "{" as %7B.
+        spec = self._spec(
+            "#/components/Pet%20Dog",
+            components={"Pet Dog": {"type": "integer"}},
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+        # "{" and "}" are not legal fragment characters either, so a legal
+        # ref to a templated path item arrives as ~1pets~1%7Bid%7D.
+        spec = {
+            "paths": {
+                "/pets/{id}": {"get": {"type": "integer"}},
+                "/x": {
+                    "get": {"schema": {"$ref": "#/paths/~1pets~1%7Bid%7D/get"}}
+                },
+            }
+        }
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+
+    def test_percent_decoding_is_the_only_reading_of_a_fragment(self):
+        # Both names exist, so the ref is only unambiguous because the
+        # fragment is decoded exactly once: %20 is a space, and a literal
+        # '%' has to arrive as %25.
+        components = {
+            "Pet%20Dog": {"type": "integer"},
+            "Pet Dog": {"type": "string"},
+        }
+        spec = self._spec("#/components/Pet%20Dog", components=components)
+        assert self._schema(resolve_refs(spec)) == {"type": "string"}
+        spec = self._spec("#/components/Pet%2520Dog", components=components)
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+
+    def test_encoded_separator_is_a_separator(self):
+        # %2F decodes to a separator, not to a slash inside a member name --
+        # a name holding a slash is ~1 (or %7E1).
+        spec = self._spec(
+            "#/components%2Fa/b", components={"a": {"b": {"type": "integer"}}}
+        )
+        assert self._schema(resolve_refs(spec)) == {"type": "integer"}
+        spec = self._spec("#/components/a%7E1b", components={"a/b": {"type": "string"}})
+        assert self._schema(resolve_refs(spec)) == {"type": "string"}
+
+    def test_ref_through_non_container_is_unresolved(self):
+        spec = self._spec("#/leaf/deeper", leaf=42)
+        assert self._schema(resolve_refs(spec)) == {"$ref": "#/leaf/deeper"}
+
+    def test_external_ref_is_left_intact(self, capsys):
+        spec = self._spec("other.yaml#/components/Pet")
+        assert self._schema(resolve_refs(spec)) == {"$ref": "other.yaml#/components/Pet"}
+        assert capsys.readouterr().err == ""
+
+
+class TestSplitShellCommand:
+    """--mcp-stdio/--spec command strings: POSIX shlex rules eat Windows
+    backslashes, so Windows splits without escapes (#122)."""
+
+    def _split_as(self, monkeypatch, os_name, command):
+        import os
+
+        from mcp2cli import split_shell_command
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "name", os_name)
+            return split_shell_command(command)
+
+    def test_windows_unquoted_path_keeps_backslashes(self, monkeypatch):
+        assert self._split_as(monkeypatch, "nt", r"C:\Python313\python.exe -m my_server") == [
+            r"C:\Python313\python.exe",
+            "-m",
+            "my_server",
+        ]
+
+    def test_windows_quoted_path_and_args(self, monkeypatch):
+        assert self._split_as(
+            monkeypatch, "nt", r'"C:\Program Files\Py\python.exe" -c "print(1)"'
+        ) == [r"C:\Program Files\Py\python.exe", "-c", "print(1)"]
+
+    def test_posix_rules_unchanged(self, monkeypatch):
+        assert self._split_as(monkeypatch, "posix", r'python -m foo --x "a b" c\ d') == [
+            "python",
+            "-m",
+            "foo",
+            "--x",
+            "a b",
+            "c d",
+        ]
